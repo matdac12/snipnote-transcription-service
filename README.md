@@ -27,15 +27,40 @@ Server-side audio transcription using OpenAI Whisper API.
 
 ## Deployment to Render
 
+### Option 1: Using render.yaml (Recommended)
+
+The `render.yaml` file automatically configures both the web service and cron worker:
+
+1. Push this repository to GitHub
+2. In Render Dashboard, click "New" → "Blueprint"
+3. Connect your GitHub repository
+4. Render will detect `render.yaml` and create:
+   - **Web Service**: API endpoints
+   - **Cron Job**: Background worker (runs every 2 minutes)
+5. Add environment variables to both services:
+   - `OPENAI_API_KEY` - Your OpenAI API key
+   - `SUPABASE_URL` - Your Supabase project URL
+   - `SUPABASE_SERVICE_KEY` - Your Supabase service role key
+   - `API_KEY` - (Optional) API key for endpoint authentication
+
+### Option 2: Manual Setup
+
+**Web Service:**
 1. Create new Web Service on Render
 2. Connect to this GitHub repository
 3. Configure:
    - **Build Command**: `pip install -r requirements.txt`
    - **Start Command**: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-4. Add Environment Variable:
-   - Key: `OPENAI_API_KEY`
-   - Value: Your OpenAI API key
-5. Deploy
+4. Add environment variables (see above)
+
+**Cron Job:**
+1. Create new Cron Job on Render
+2. Connect to same GitHub repository
+3. Configure:
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `python worker.py`
+   - **Schedule**: `*/2 * * * *` (every 2 minutes)
+4. Add environment variables (see above)
 
 ## API Endpoints
 
