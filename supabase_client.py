@@ -133,3 +133,55 @@ def update_job_status(
     except Exception as e:
         print(f"❌ Error updating job {job_id}: {e}")
         raise
+
+
+def update_job_with_results(
+    job_id: str,
+    transcript: str,
+    overview: str,
+    summary: str,
+    actions: list,
+    duration: float
+) -> Dict[str, Any]:
+    """
+    Update job with all AI-generated results
+
+    Args:
+        job_id: UUID of the job to update
+        transcript: Full meeting transcript
+        overview: 1-sentence overview
+        summary: Comprehensive meeting summary
+        actions: List of action items
+        duration: Audio duration in seconds
+
+    Returns:
+        Dict containing updated job data
+
+    Raises:
+        Exception: If update fails
+    """
+    try:
+        import json
+
+        update_data = {
+            "status": "completed",
+            "transcript": transcript,
+            "overview": overview,
+            "summary": summary,
+            "actions": json.dumps(actions),  # Store as JSONB
+            "duration": duration,
+            "completed_at": datetime.utcnow().isoformat()
+        }
+
+        response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).execute()
+
+        if response.data and len(response.data) > 0:
+            job = response.data[0]
+            print(f"✅ Updated job {job_id} with complete AI results")
+            return job
+        else:
+            raise Exception(f"Failed to update job {job_id}: No data returned")
+
+    except Exception as e:
+        print(f"❌ Error updating job {job_id} with results: {e}")
+        raise

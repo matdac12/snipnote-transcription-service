@@ -1,8 +1,14 @@
 import httpx
 import io
+import json
+import os
 from typing import List, Dict, Any
-from supabase_client import supabase, update_job_status
+from openai import OpenAI
+from supabase_client import supabase, update_job_status, update_job_with_results
 from transcribe import transcribe_audio
+
+# Initialize OpenAI client
+openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 
 def get_pending_jobs() -> List[Dict[str, Any]]:
@@ -48,9 +54,111 @@ def download_audio(audio_url: str) -> bytes:
     return response.content
 
 
+def generate_overview(transcript: str) -> str:
+    """Generate 1-sentence meeting overview using GPT-4o"""
+    print(f"   📝 Generating overview...")
+
+    prompt = f"""Identify the language spoken and always respond in the same language as the input transcript.
+Summarize this meeting transcript in exactly one short, clear sentence. Capture the main topic and key outcome or focus of the meeting.
+
+Examples:
+- "Team discussed Q4 goals and assigned project leads for upcoming initiatives."
+- "Budget review meeting where department heads presented spending proposals."
+- "Weekly standup covering project progress and addressing technical blockers."
+
+Meeting Transcript: {transcript}"""
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You create concise one-sentence meeting overviews. Always respond with exactly one clear, informative sentence in the same language as the input transcript."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=50
+    )
+
+    overview = response.choices[0].message.content.strip()
+    print(f"   ✅ Overview generated: {overview[:80]}...")
+    return overview
+
+
+def generate_summary(transcript: str) -> str:
+    """Generate comprehensive meeting summary using GPT-4o"""
+    print(f"   📄 Generating summary...")
+
+    prompt = f"""Identify the language spoken and always respond in the same language as the input transcript.
+Please create a comprehensive meeting summary from this transcript. Structure your response with the following sections:
+
+## Key Discussion Points
+- Main topics discussed
+- Important insights shared
+
+## Decisions Made
+- Key decisions reached during the meeting
+- Who is responsible for what
+
+## Action Items
+- Tasks assigned with responsible parties
+- Deadlines mentioned
+
+## Next Steps
+- Follow-up actions
+- Future meetings or milestones
+
+Meeting Transcript: {transcript}"""
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a professional meeting summarizer. Create structured, comprehensive summaries that capture key decisions, action items, and next steps. Always respond in the same language as the input transcript."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=800
+    )
+
+    summary = response.choices[0].message.content
+    print(f"   ✅ Summary generated ({len(summary)} chars)")
+    return summary
+
+
+def extract_actions(transcript: str) -> list:
+    """Extract action items from transcript using GPT-4o"""
+    print(f"   ✅ Extracting actions...")
+
+    prompt = f"""Identify the language spoken and always respond in the same language as the input transcript.
+Extract actionable items from this transcript. For each action item, provide:
+1. A clear, concise action description
+2. Priority level (HIGH, MED, LOW)
+
+Return ONLY a JSON array with this exact format:
+[{{"action": "action description", "priority": "HIGH|MED|LOW"}}]
+
+If no actionable items exist, return an empty array: []
+
+Transcript: {transcript}"""
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You extract actionable items from text and return them as JSON. Be precise and only return valid JSON. Always use the same language as the input transcript for action descriptions."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=300
+    )
+
+    try:
+        actions_json = response.choices[0].message.content
+        actions = json.loads(actions_json)
+        print(f"   ✅ Actions extracted: {len(actions)} items")
+        return actions
+    except json.JSONDecodeError:
+        print("   ⚠️  Failed to parse actions JSON, returning empty array")
+        return []
+
+
 def process_job(job: Dict[str, Any]):
     """
-    Process a single transcription job
+    Process a single transcription job with full AI pipeline
 
     Args:
         job: Job dictionary from Supabase
@@ -75,16 +183,27 @@ def process_job(job: Dict[str, Any]):
 
         print(f"   ✅ Transcription complete: {len(transcript)} chars, {duration:.1f}s")
 
-        # Step 4: Update job with transcript and status='completed'
-        print(f"   💾 Saving transcript to database...")
-        update_job_status(
+        # Step 4: Generate AI content
+        overview = generate_overview(transcript)
+        summary = generate_summary(transcript)
+        actions = extract_actions(transcript)
+
+        # Step 5: Update job with all results and status='completed'
+        print(f"   💾 Saving all results to database...")
+        update_job_with_results(
             job_id=job_id,
-            status="completed",
             transcript=transcript,
+            overview=overview,
+            summary=summary,
+            actions=actions,
             duration=duration
         )
 
         print(f"✅ Job {job_id} completed successfully!")
+        print(f"   - Transcript: {len(transcript)} chars")
+        print(f"   - Overview: {overview[:80]}...")
+        print(f"   - Summary: {len(summary)} chars")
+        print(f"   - Actions: {len(actions)} items")
 
     except Exception as e:
         # Error handling: update job status to 'failed' with error message
