@@ -16,18 +16,25 @@ For continuous mode:
 import time
 import sys
 import warnings
+import os
+import asyncio
 from jobs import process_pending_jobs
 
 # Suppress pydub regex warnings in Python 3.13+
 warnings.filterwarnings("ignore", category=SyntaxWarning, module="pydub")
 
+# Configurable concurrency limit (can be overridden via environment variable)
+# With 2GB RAM, you can safely handle 3-5 concurrent jobs
+MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "3"))
+
 
 def run_once():
     """
     Run worker once: process all pending jobs and exit
+    Processes up to MAX_CONCURRENT_JOBS in parallel for better performance
     """
-    print("🚀 Starting transcription worker (single run)...")
-    process_pending_jobs()
+    print(f"🚀 Starting transcription worker (single run, max {MAX_CONCURRENT_JOBS} concurrent)...")
+    asyncio.run(process_pending_jobs(max_concurrent=MAX_CONCURRENT_JOBS))
     print("✅ Worker finished\n")
 
 
@@ -38,12 +45,12 @@ def run_continuous(interval_seconds: int = 60):
     Args:
         interval_seconds: Time to wait between checks (default 60)
     """
-    print(f"🚀 Starting transcription worker (continuous mode, checking every {interval_seconds}s)...")
+    print(f"🚀 Starting transcription worker (continuous mode, max {MAX_CONCURRENT_JOBS} concurrent, checking every {interval_seconds}s)...")
     print("   Press Ctrl+C to stop\n")
 
     try:
         while True:
-            process_pending_jobs()
+            asyncio.run(process_pending_jobs(max_concurrent=MAX_CONCURRENT_JOBS))
             print(f"⏰ Waiting {interval_seconds}s before next check...")
             time.sleep(interval_seconds)
     except KeyboardInterrupt:

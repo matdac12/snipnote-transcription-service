@@ -22,7 +22,7 @@ services:
   - type: cron
     name: snipnote-transcription-worker
     env: python
-    schedule: "*/2 * * * *"  # Run every 2 minutes
+    schedule: "* * * * *"  # Run every 1 minute for faster response
     buildCommand: |
       chmod +x install_ffmpeg.sh
       ./install_ffmpeg.sh

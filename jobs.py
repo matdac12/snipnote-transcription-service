@@ -2,6 +2,7 @@ import httpx
 import io
 import json
 import os
+import asyncio
 from typing import List, Dict, Any
 from openai import OpenAI
 from supabase_client import supabase, update_job_status, update_job_with_results, update_job_progress
@@ -276,9 +277,12 @@ def process_job(job: Dict[str, Any]):
             print(f"   ⚠️  Failed to update job status: {update_error}")
 
 
-def process_pending_jobs():
+async def process_pending_jobs(max_concurrent: int = 3):
     """
-    Main function to process all pending transcription jobs
+    Main function to process all pending transcription jobs in parallel
+
+    Args:
+        max_concurrent: Maximum number of jobs to process concurrently (default 3)
 
     For each pending job:
     1. Update status to 'processing'
@@ -286,16 +290,43 @@ def process_pending_jobs():
     3. Transcribe using OpenAI Whisper
     4. Update job with transcript and status='completed'
     5. Handle errors by marking job as 'failed'
+
+    Jobs are processed in parallel up to max_concurrent limit for better performance.
     """
     pending_jobs = get_pending_jobs()
 
     if not pending_jobs:
         return
 
-    for job in pending_jobs:
-        job_id = job["id"]
-        print(f"\n🔄 Processing job {job_id}...")
-        process_job(job)
+    print(f"📊 Found {len(pending_jobs)} pending job(s), processing up to {max_concurrent} concurrently")
+
+    # Process jobs in batches of max_concurrent
+    for i in range(0, len(pending_jobs), max_concurrent):
+        batch = pending_jobs[i:i + max_concurrent]
+
+        print(f"\n🔄 Processing batch of {len(batch)} job(s)...")
+
+        # Process batch in parallel using asyncio.gather
+        tasks = [process_job_async(job) for job in batch]
+        await asyncio.gather(*tasks)
+
+        if i + max_concurrent < len(pending_jobs):
+            print(f"✅ Batch complete, {len(pending_jobs) - (i + max_concurrent)} job(s) remaining")
+
+
+async def process_job_async(job: Dict[str, Any]):
+    """
+    Async wrapper for process_job to enable parallel processing
+
+    Args:
+        job: Job dictionary from Supabase
+    """
+    job_id = job["id"]
+    print(f"\n🔄 [Job {job_id[:8]}] Starting...")
+
+    # Run the synchronous process_job in a thread pool to avoid blocking
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, process_job, job)
 
 
 if __name__ == "__main__":
