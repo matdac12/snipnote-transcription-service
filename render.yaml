@@ -3,7 +3,10 @@ services:
   - type: web
     name: snipnote-transcription
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      chmod +x install_ffmpeg.sh
+      ./install_ffmpeg.sh
+      pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: OPENAI_API_KEY
@@ -20,7 +23,10 @@ services:
     name: snipnote-transcription-worker
     env: python
     schedule: "*/2 * * * *"  # Run every 2 minutes
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      chmod +x install_ffmpeg.sh
+      ./install_ffmpeg.sh
+      pip install -r requirements.txt
     startCommand: python worker.py
     envVars:
       - key: OPENAI_API_KEY
