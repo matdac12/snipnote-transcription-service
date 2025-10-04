@@ -55,7 +55,7 @@ class JobStatusResponse(BaseModel):
     id: str
     user_id: str
     meeting_id: str
-    audio_url: str
+    audio_url: str | None = None      # Optional for chunked jobs
     status: str
     transcript: str | None = None
     overview: str | None = None      # AI-generated 1-sentence overview
