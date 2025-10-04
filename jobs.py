@@ -147,12 +147,37 @@ Transcript: {transcript}"""
     )
 
     try:
-        actions_json = response.choices[0].message.content
-        actions = json.loads(actions_json)
+        actions_text = response.choices[0].message.content.strip()
+
+        # Extract JSON from markdown code blocks if present
+        if "```json" in actions_text:
+            # Extract content between ```json and ```
+            start = actions_text.find("```json") + 7
+            end = actions_text.find("```", start)
+            actions_text = actions_text[start:end].strip()
+        elif "```" in actions_text:
+            # Extract content between ``` and ```
+            start = actions_text.find("```") + 3
+            end = actions_text.find("```", start)
+            actions_text = actions_text[start:end].strip()
+
+        # Try to parse the JSON
+        actions = json.loads(actions_text)
+
+        # Validate it's a list
+        if not isinstance(actions, list):
+            print(f"   ⚠️  GPT returned non-list JSON: {type(actions)}, returning empty array")
+            return []
+
         print(f"   ✅ Actions extracted: {len(actions)} items")
         return actions
-    except json.JSONDecodeError:
-        print("   ⚠️  Failed to parse actions JSON, returning empty array")
+
+    except json.JSONDecodeError as e:
+        print(f"   ⚠️  Failed to parse actions JSON: {e}")
+        print(f"   📝 GPT response was: {response.choices[0].message.content[:200]}")
+        return []
+    except Exception as e:
+        print(f"   ⚠️  Unexpected error extracting actions: {e}")
         return []
 
 

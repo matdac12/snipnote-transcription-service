@@ -15,7 +15,11 @@ For continuous mode:
 
 import time
 import sys
+import warnings
 from jobs import process_pending_jobs
+
+# Suppress pydub regex warnings in Python 3.13+
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="pydub")
 
 
 def run_once():

@@ -3,8 +3,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 import os
+import warnings
 from transcribe import transcribe_audio
 from supabase_client import create_job, get_job
+
+# Suppress pydub regex warnings in Python 3.13+
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="pydub")
 
 app = FastAPI(title="SnipNote Transcription Service")
 
