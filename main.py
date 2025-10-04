@@ -39,7 +39,10 @@ async def verify_api_key(x_api_key: str = Header(None)):
 class CreateJobRequest(BaseModel):
     user_id: str
     meeting_id: str
-    audio_url: str
+    audio_url: str | None = None  # Optional for chunked jobs
+    is_chunked: bool = False
+    total_chunks: int = 1
+    duration: float | None = None
 
 
 class CreateJobResponse(BaseModel):
@@ -85,16 +88,25 @@ async def create_transcription_job(
     authenticated: bool = Depends(verify_api_key)
 ):
     """
-    Create a new transcription job
+    Create a new transcription job (regular or chunked)
 
     The job will be queued with status='pending' and processed by the background worker.
+
+    For chunked jobs:
+    - Set is_chunked=true
+    - Provide total_chunks and duration
+    - Audio chunks should be pre-uploaded to audio_chunks table
+    - Worker will fetch chunks from database using meeting_id
     """
     try:
         # Create job in Supabase
         job = create_job(
             user_id=request.user_id,
             meeting_id=request.meeting_id,
-            audio_url=request.audio_url
+            audio_url=request.audio_url,
+            is_chunked=request.is_chunked,
+            total_chunks=request.total_chunks,
+            duration=request.duration
         )
 
         return CreateJobResponse(

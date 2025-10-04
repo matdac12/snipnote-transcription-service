@@ -5,7 +5,15 @@ import os
 import asyncio
 from typing import List, Dict, Any
 from openai import OpenAI
-from supabase_client import supabase, update_job_status, update_job_with_results, update_job_progress
+from supabase_client import (
+    supabase,
+    update_job_status,
+    update_job_with_results,
+    update_job_progress,
+    get_audio_chunks,
+    update_chunk_transcript,
+    update_chunks_processed
+)
 from transcribe import transcribe_audio
 
 # Initialize OpenAI client
@@ -182,14 +190,169 @@ Transcript: {transcript}"""
         return []
 
 
-def process_job(job: Dict[str, Any]):
+def download_chunk_from_storage(chunk_file_path: str) -> bytes:
     """
-    Process a single transcription job with full AI pipeline and progress tracking
+    Download a single chunk from Supabase Storage
+
+    Args:
+        chunk_file_path: File path in storage (e.g., "userId/meetingId_chunk_0.m4a")
+
+    Returns:
+        Audio chunk bytes
+
+    Raises:
+        Exception: If download fails
+    """
+    try:
+        print(f"   📥 Downloading chunk: {chunk_file_path}")
+
+        # Download from Supabase Storage using service key
+        response = supabase.storage.from_("recordings").download(chunk_file_path)
+
+        print(f"   ✅ Downloaded chunk: {len(response)} bytes")
+        return response
+
+    except Exception as e:
+        print(f"   ❌ Failed to download chunk {chunk_file_path}: {e}")
+        raise
+
+
+def process_chunked_job(job: Dict[str, Any]):
+    """
+    Process a chunked transcription job
 
     Args:
         job: Job dictionary from Supabase
     """
     job_id = job["id"]
+    meeting_id = job["meeting_id"]
+    total_chunks = job.get("total_chunks", 0)
+
+    try:
+        # Step 1: Update status to 'processing'
+        print(f"   📦 Processing chunked job ({total_chunks} chunks)...")
+        update_job_status(job_id, "processing")
+        update_job_progress(job_id, 0, "Starting chunked transcription...")
+
+        # Step 2: Fetch all audio chunks from database
+        print(f"   📋 Fetching audio chunks from database...")
+        update_job_progress(job_id, 5, "Fetching audio chunks...")
+        chunks = get_audio_chunks(meeting_id)
+
+        if not chunks:
+            raise Exception(f"No audio chunks found for meeting {meeting_id}")
+
+        if len(chunks) != total_chunks:
+            print(f"   ⚠️ Expected {total_chunks} chunks, found {len(chunks)}")
+
+        # Step 3: Process each chunk (5-70% total progress)
+        transcripts = []
+        progress_per_chunk = 65 / len(chunks)  # 65% of total progress for transcription
+
+        for i, chunk in enumerate(chunks):
+            chunk_id = chunk["id"]
+            chunk_index = chunk["chunk_index"]
+            file_path = chunk["file_path"]
+
+            # Update progress
+            current_progress = 5 + int((i / len(chunks)) * 65)
+            update_job_progress(
+                job_id,
+                current_progress,
+                f"Transcribing chunk {chunk_index + 1}/{len(chunks)}..."
+            )
+
+            # Download chunk from storage
+            chunk_data = download_chunk_from_storage(file_path)
+
+            # Transcribe chunk
+            print(f"   🎤 Transcribing chunk {chunk_index + 1}/{len(chunks)}...")
+            result = transcribe_audio(chunk_data, f"chunk_{chunk_index}.m4a")
+            transcript = result["transcript"]
+
+            # Save transcript to chunk
+            update_chunk_transcript(chunk_id, transcript)
+
+            # Add to transcripts list
+            transcripts.append(transcript)
+
+            # Update chunks_processed count
+            update_chunks_processed(job_id, i + 1)
+
+            print(f"   ✅ Chunk {chunk_index + 1}/{len(chunks)} transcribed ({len(transcript)} chars)")
+
+        # Step 4: Merge transcripts (70%)
+        print(f"   🔗 Merging {len(transcripts)} chunk transcripts...")
+        update_job_progress(job_id, 70, "Merging transcripts...")
+        full_transcript = "\n".join(transcripts)
+        print(f"   ✅ Merged transcript: {len(full_transcript)} chars")
+
+        # Step 5: Generate AI content (70-90%)
+        update_job_progress(job_id, 70, "Generating overview...")
+        overview = generate_overview(full_transcript)
+
+        update_job_progress(job_id, 75, "Generating summary...")
+        summary = generate_summary(full_transcript)
+
+        update_job_progress(job_id, 85, "Extracting actions...")
+        actions = extract_actions(full_transcript)
+
+        # Step 6: Save results (90-100%)
+        print(f"   💾 Saving all results to database...")
+        update_job_progress(job_id, 95, "Saving results...")
+
+        # Use duration from job if available, otherwise calculate from chunks
+        duration = job.get("duration")
+        if not duration:
+            duration = sum(chunk.get("duration_seconds", 0) for chunk in chunks)
+
+        update_job_with_results(
+            job_id=job_id,
+            transcript=full_transcript,
+            overview=overview,
+            summary=summary,
+            actions=actions,
+            duration=duration
+        )
+
+        print(f"✅ Chunked job {job_id} completed successfully!")
+        print(f"   - Chunks processed: {len(chunks)}")
+        print(f"   - Total transcript: {len(full_transcript)} chars")
+        print(f"   - Overview: {overview[:80]}...")
+        print(f"   - Summary: {len(summary)} chars")
+        print(f"   - Actions: {len(actions)} items")
+
+    except Exception as e:
+        error_message = str(e)
+        print(f"❌ Chunked job {job_id} failed: {error_message}")
+
+        try:
+            update_job_status(job_id=job_id, status="failed", error=error_message)
+            update_job_progress(job_id, 0, f"Failed: {error_message[:50]}...")
+            print(f"   💾 Error saved to database")
+        except Exception as update_error:
+            print(f"   ⚠️  Failed to update job status: {update_error}")
+
+
+def process_job(job: Dict[str, Any]):
+    """
+    Process a single transcription job with full AI pipeline and progress tracking
+
+    Routes to chunked or regular processing based on job type.
+
+    Args:
+        job: Job dictionary from Supabase
+    """
+    job_id = job["id"]
+    is_chunked = job.get("is_chunked", False)
+
+    # Route to appropriate handler
+    if is_chunked:
+        print(f"   🔀 Routing to chunked job processor...")
+        process_chunked_job(job)
+        return
+
+    # Regular (non-chunked) job processing
     audio_url = job["audio_url"]
 
     try:
