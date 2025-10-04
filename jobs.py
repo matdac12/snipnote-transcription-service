@@ -4,7 +4,7 @@ import json
 import os
 from typing import List, Dict, Any
 from openai import OpenAI
-from supabase_client import supabase, update_job_status, update_job_with_results
+from supabase_client import supabase, update_job_status, update_job_with_results, update_job_progress
 from transcribe import transcribe_audio
 
 # Initialize OpenAI client
@@ -158,7 +158,7 @@ Transcript: {transcript}"""
 
 def process_job(job: Dict[str, Any]):
     """
-    Process a single transcription job with full AI pipeline
+    Process a single transcription job with full AI pipeline and progress tracking
 
     Args:
         job: Job dictionary from Supabase
@@ -167,29 +167,57 @@ def process_job(job: Dict[str, Any]):
     audio_url = job["audio_url"]
 
     try:
-        # Step 1: Update status to 'processing'
+        # Step 1: Update status to 'processing' and set initial progress
         print(f"   ⚙️  Updating status to 'processing'...")
         update_job_status(job_id, "processing")
+        update_job_progress(job_id, 0, "Starting job...")
 
-        # Step 2: Download audio
+        # Step 2: Download audio (0-10%)
+        print(f"   📥 Downloading audio...")
+        update_job_progress(job_id, 5, "Downloading audio...")
         audio_data = download_audio(audio_url)
+        update_job_progress(job_id, 10, "Audio downloaded")
 
-        # Step 3: Transcribe using OpenAI Whisper
+        # Step 3: Transcribe using OpenAI Whisper (10-60%)
         print(f"   🎤 Transcribing audio...")
-        result = transcribe_audio(audio_data, "audio.m4a")
+
+        def transcription_progress(pct: float, stage: str):
+            """Callback to report transcription progress (maps 0-100 to 10-60)"""
+            adjusted_pct = 10 + int(pct * 0.5)  # Scale to 10-60% range
+            update_job_progress(job_id, adjusted_pct, stage)
+
+        result = transcribe_audio(
+            audio_data,
+            "audio.m4a",
+            progress_callback=transcription_progress
+        )
 
         transcript = result["transcript"]
         duration = result["duration"]
 
         print(f"   ✅ Transcription complete: {len(transcript)} chars, {duration:.1f}s")
 
-        # Step 4: Generate AI content
-        overview = generate_overview(transcript)
-        summary = generate_summary(transcript)
-        actions = extract_actions(transcript)
+        # Step 4: Generate AI content (60-90%)
 
-        # Step 5: Update job with all results and status='completed'
+        # 4a: Overview (60-70%)
+        update_job_progress(job_id, 60, "Generating overview...")
+        overview = generate_overview(transcript)
+        update_job_progress(job_id, 70, "Overview generated")
+
+        # 4b: Summary (70-80%)
+        update_job_progress(job_id, 70, "Generating summary...")
+        summary = generate_summary(transcript)
+        update_job_progress(job_id, 80, "Summary generated")
+
+        # 4c: Actions (80-90%)
+        update_job_progress(job_id, 80, "Extracting actions...")
+        actions = extract_actions(transcript)
+        update_job_progress(job_id, 90, "Actions extracted")
+
+        # Step 5: Update job with all results and status='completed' (90-100%)
         print(f"   💾 Saving all results to database...")
+        update_job_progress(job_id, 95, "Saving results...")
+
         update_job_with_results(
             job_id=job_id,
             transcript=transcript,
@@ -198,6 +226,7 @@ def process_job(job: Dict[str, Any]):
             actions=actions,
             duration=duration
         )
+        # update_job_with_results automatically sets progress to 100% and stage to "Complete"
 
         print(f"✅ Job {job_id} completed successfully!")
         print(f"   - Transcript: {len(transcript)} chars")
@@ -216,6 +245,7 @@ def process_job(job: Dict[str, Any]):
                 status="failed",
                 error=error_message
             )
+            update_job_progress(job_id, 0, f"Failed: {error_message[:50]}...")
             print(f"   💾 Error saved to database")
         except Exception as update_error:
             print(f"   ⚠️  Failed to update job status: {update_error}")

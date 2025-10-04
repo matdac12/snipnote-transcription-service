@@ -51,11 +51,13 @@ class JobStatusResponse(BaseModel):
     audio_url: str
     status: str
     transcript: str | None = None
-    overview: str | None = None      # NEW: AI-generated 1-sentence overview
-    summary: str | None = None        # NEW: AI-generated full summary
-    actions: list | None = None       # NEW: AI-extracted action items
+    overview: str | None = None      # AI-generated 1-sentence overview
+    summary: str | None = None        # AI-generated full summary
+    actions: list | None = None       # AI-extracted action items
     duration: float | None = None
     error_message: str | None = None
+    progress_percentage: int = 0      # Progress from 0-100
+    current_stage: str | None = None  # Human-readable stage description
     created_at: str
     updated_at: str
     completed_at: str | None = None

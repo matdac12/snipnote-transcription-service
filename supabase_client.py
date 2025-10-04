@@ -135,6 +135,43 @@ def update_job_status(
         raise
 
 
+def update_job_progress(
+    job_id: str,
+    progress: int,
+    stage: str
+) -> Dict[str, Any]:
+    """
+    Update job progress and current stage
+
+    Args:
+        job_id: UUID of the job to update
+        progress: Progress percentage (0-100)
+        stage: Human-readable stage description
+
+    Returns:
+        Dict containing updated job data
+
+    Raises:
+        Exception: If update fails
+    """
+    try:
+        update_data = {
+            "progress_percentage": progress,
+            "current_stage": stage
+        }
+
+        response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).execute()
+
+        if response.data and len(response.data) > 0:
+            return response.data[0]
+        else:
+            raise Exception(f"Failed to update job {job_id} progress: No data returned")
+
+    except Exception as e:
+        print(f"❌ Error updating job {job_id} progress: {e}")
+        raise
+
+
 def update_job_with_results(
     job_id: str,
     transcript: str,
@@ -170,6 +207,8 @@ def update_job_with_results(
             "summary": summary,
             "actions": json.dumps(actions),  # Store as JSONB
             "duration": duration,
+            "progress_percentage": 100,  # Mark as 100% complete
+            "current_stage": "Complete",
             "completed_at": datetime.utcnow().isoformat()
         }
 
