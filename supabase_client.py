@@ -198,14 +198,12 @@ def update_job_with_results(
         Exception: If update fails
     """
     try:
-        import json
-
         update_data = {
             "status": "completed",
             "transcript": transcript,
             "overview": overview,
             "summary": summary,
-            "actions": json.dumps(actions),  # Store as JSONB
+            "actions": actions,  # Supabase client handles JSONB conversion automatically
             "duration": duration,
             "progress_percentage": 100,  # Mark as 100% complete
             "current_stage": "Complete",
