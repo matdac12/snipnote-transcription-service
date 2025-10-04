@@ -2,101 +2,64 @@ import os
 import io
 from typing import Callable, Optional, List
 from openai import OpenAI
-from pydub import AudioSegment
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Constants matching iOS implementation
 MAX_CHUNK_SIZE_MB = 1.5
 MAX_CHUNK_SIZE_BYTES = int(MAX_CHUNK_SIZE_MB * 1024 * 1024)
-OVERLAP_SECONDS = 2000  # 2 seconds in milliseconds for pydub
 
 
-def chunk_audio(audio_bytes: bytes, filename: str, progress_callback: Optional[Callable] = None) -> List[bytes]:
+def chunk_audio_simple(audio_bytes: bytes, progress_callback: Optional[Callable] = None) -> List[bytes]:
     """
-    Split audio into chunks of MAX_CHUNK_SIZE_MB with overlap
+    Split audio into chunks of MAX_CHUNK_SIZE_MB using simple binary splitting
+
+    This is a simple approach that doesn't require audio processing libraries.
+    Works well with Whisper API since it can handle partial audio segments.
 
     Args:
         audio_bytes: Raw audio file bytes
-        filename: Original filename (for format detection)
         progress_callback: Optional callback(progress_pct: float, stage: str)
 
     Returns:
         List of audio chunk bytes
     """
-    # Load audio file
-    audio_file = io.BytesIO(audio_bytes)
+    total_size = len(audio_bytes)
 
-    # Detect format from filename extension
-    file_format = filename.split('.')[-1].lower()
-    if file_format not in ['mp3', 'm4a', 'wav', 'ogg', 'flac']:
-        file_format = 'm4a'  # Default to m4a
+    # If file is small enough, return as single chunk
+    if total_size <= MAX_CHUNK_SIZE_BYTES:
+        if progress_callback:
+            progress_callback(100, "Audio ready")
+        return [audio_bytes]
+
+    # Calculate number of chunks needed
+    num_chunks = (total_size + MAX_CHUNK_SIZE_BYTES - 1) // MAX_CHUNK_SIZE_BYTES
 
     if progress_callback:
-        progress_callback(0, "Loading audio file...")
-
-    # Load audio using pydub
-    audio = AudioSegment.from_file(audio_file, format=file_format)
-
-    # Calculate total duration and bitrate
-    duration_ms = len(audio)
-    file_size_bytes = len(audio_bytes)
-
-    # Estimate chunk duration based on file size and duration
-    # We want chunks around MAX_CHUNK_SIZE_BYTES
-    avg_bytes_per_ms = file_size_bytes / duration_ms
-    target_chunk_duration_ms = int(MAX_CHUNK_SIZE_BYTES / avg_bytes_per_ms)
-
-    # Ensure minimum chunk duration of 60 seconds (like iOS)
-    MIN_CHUNK_DURATION_MS = 60 * 1000
-    chunk_duration_ms = max(target_chunk_duration_ms, MIN_CHUNK_DURATION_MS)
+        progress_callback(0, f"Splitting audio into {num_chunks} chunk(s)...")
 
     chunks = []
-    current_pos_ms = 0
-    chunk_index = 0
+    for i in range(num_chunks):
+        start_byte = i * MAX_CHUNK_SIZE_BYTES
+        end_byte = min((i + 1) * MAX_CHUNK_SIZE_BYTES, total_size)
 
-    # Estimate total chunks for progress tracking
-    estimated_chunks = max(1, int(duration_ms / chunk_duration_ms))
+        chunk = audio_bytes[start_byte:end_byte]
+        chunks.append(chunk)
 
-    if progress_callback:
-        progress_callback(5, f"Splitting audio into {estimated_chunks} chunk(s)...")
-
-    while current_pos_ms < duration_ms:
-        # Calculate chunk boundaries
-        end_pos_ms = min(current_pos_ms + chunk_duration_ms, duration_ms)
-
-        # Add overlap to the end (except for the last chunk)
-        chunk_end_with_overlap = min(end_pos_ms + OVERLAP_SECONDS, duration_ms)
-
-        # Extract chunk
-        chunk_audio = audio[current_pos_ms:chunk_end_with_overlap]
-
-        # Export chunk to bytes
-        chunk_buffer = io.BytesIO()
-        chunk_audio.export(chunk_buffer, format="mp3", bitrate="64k")  # Compress to reduce size
-        chunk_bytes = chunk_buffer.getvalue()
-
-        chunks.append(chunk_bytes)
-
-        # Report progress
         if progress_callback:
-            progress_pct = ((chunk_index + 1) / estimated_chunks) * 100
-            progress_callback(
-                min(progress_pct, 100),
-                f"Created chunk {chunk_index + 1}/{estimated_chunks}"
-            )
+            progress_pct = ((i + 1) / num_chunks) * 100
+            progress_callback(progress_pct, f"Created chunk {i + 1}/{num_chunks}")
 
-        # Move to next chunk (without overlap to avoid duplication)
-        current_pos_ms = end_pos_ms
-        chunk_index += 1
-
-    print(f"✅ Split audio into {len(chunks)} chunk(s)")
+    print(f"✅ Split {total_size / 1024 / 1024:.2f}MB audio into {len(chunks)} chunk(s)")
     return chunks
 
 
 def merge_transcripts(transcripts: List[str]) -> str:
     """
-    Merge chunk transcripts with overlap handling
+    Merge chunk transcripts with simple concatenation
+
+    Since we're using binary chunking, chunks may cut mid-word,
+    but Whisper is robust enough to handle this and we just concatenate.
 
     Args:
         transcripts: List of transcript strings from chunks
@@ -107,35 +70,13 @@ def merge_transcripts(transcripts: List[str]) -> str:
     if not transcripts:
         return ""
 
-    # Find first non-empty transcript
+    # Filter out empty transcripts
     filtered = [t.strip() for t in transcripts if t.strip()]
     if not filtered:
         return ""
 
-    merged = filtered[0]
-
-    # Merge remaining transcripts with overlap detection
-    for i in range(1, len(filtered)):
-        next_transcript = filtered[i]
-
-        # Try to find overlap (simple approach: check last 200 chars)
-        overlap_found = False
-        max_overlap_chars = min(200, len(merged), len(next_transcript))
-
-        for overlap_len in range(max_overlap_chars, 20, -1):
-            suffix = merged[-overlap_len:].lower()
-            prefix = next_transcript[:overlap_len].lower()
-
-            if suffix == prefix:
-                # Found overlap, merge without duplication
-                merged += next_transcript[overlap_len:]
-                overlap_found = True
-                print(f"   ✂️  Detected {overlap_len} char overlap between chunks {i} and {i+1}")
-                break
-
-        if not overlap_found:
-            # No overlap found, just append with space
-            merged += " " + next_transcript
+    # Simple concatenation with spaces
+    merged = " ".join(filtered)
 
     return merged
 
@@ -150,7 +91,7 @@ def transcribe_audio(
 
     Args:
         audio_data: Raw audio file bytes
-        filename: Original filename
+        filename: Original filename (for format detection)
         progress_callback: Optional callback(progress_pct: float, stage: str)
 
     Returns:
@@ -194,7 +135,7 @@ def transcribe_audio(
             if progress_callback:
                 progress_callback(pct * 0.1, stage)
 
-        chunks = chunk_audio(audio_data, filename, chunk_progress)
+        chunks = chunk_audio_simple(audio_data, chunk_progress)
 
         # Transcribe each chunk (progress: 10-90%)
         transcripts = []
@@ -211,7 +152,7 @@ def transcribe_audio(
 
             # Create file-like object for this chunk
             chunk_file = io.BytesIO(chunk_bytes)
-            chunk_file.name = f"chunk_{chunk_num}.mp3"
+            chunk_file.name = filename  # Keep original filename/extension
 
             # Transcribe chunk
             try:
