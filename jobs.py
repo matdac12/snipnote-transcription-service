@@ -83,7 +83,7 @@ Meeting Summary: {summary}"""
             {"role": "system", "content": "You create concise one-sentence meeting overviews. Always respond with exactly one clear, informative sentence in the same language as the input transcript."},
             {"role": "user", "content": prompt}
         ],
-        max_completion_tokens=50
+        max_completion_tokens=200
     )
 
     overview = response.choices[0].message.content.strip()
@@ -122,7 +122,7 @@ Meeting Transcript: {transcript}"""
             {"role": "system", "content": "You are a professional meeting summarizer. Create structured, comprehensive summaries that capture key decisions, action items, and next steps. Always respond in the same language as the input transcript."},
             {"role": "user", "content": prompt}
         ],
-        max_completion_tokens=800
+        max_completion_tokens=1500
     )
 
     summary = response.choices[0].message.content
@@ -152,7 +152,7 @@ Meeting Summary: {summary}"""
             {"role": "system", "content": "You extract actionable items from text and return them as JSON. Be precise and only return valid JSON. Always use the same language as the input transcript for action descriptions."},
             {"role": "user", "content": prompt}
         ],
-        max_completion_tokens=300
+        max_completion_tokens=500
     )
 
     try:
