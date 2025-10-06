@@ -77,9 +77,9 @@ Examples:
 
 Meeting Summary: {summary}"""
 
-    response = openai_client.chat.completions.create(
+    response = openai_client.responses.create(
         model="gpt-5-mini",
-        messages=[
+        input=[
             {"role": "system", "content": "You create concise one-sentence meeting overviews. Always respond with exactly one clear, informative sentence in the same language as the input transcript."},
             {"role": "user", "content": prompt}
         ],
@@ -87,7 +87,7 @@ Meeting Summary: {summary}"""
         verbosity="low"
     )
 
-    overview = response.choices[0].message.content.strip()
+    overview = response.output_text.strip()
     print(f"   ✅ Overview generated: {overview[:80]}...")
     return overview
 
@@ -117,16 +117,16 @@ Please create a comprehensive meeting summary from this transcript. Structure yo
 
 Meeting Transcript: {transcript}"""
 
-    response = openai_client.chat.completions.create(
+    response = openai_client.responses.create(
         model="gpt-5-mini",
-        messages=[
+        input=[
             {"role": "system", "content": "You are a professional meeting summarizer. Create structured, comprehensive summaries that capture key decisions, action items, and next steps. Always respond in the same language as the input transcript."},
             {"role": "user", "content": prompt}
         ],
         reasoning={"effort": "minimal"}
     )
 
-    summary = response.choices[0].message.content
+    summary = response.output_text
     print(f"   ✅ Summary generated ({len(summary)} chars)")
     return summary
 
@@ -147,9 +147,9 @@ If no actionable items exist, return an empty array: []
 
 Meeting Summary: {summary}"""
 
-    response = openai_client.chat.completions.create(
+    response = openai_client.responses.create(
         model="gpt-5-mini",
-        messages=[
+        input=[
             {"role": "system", "content": "You extract actionable items from text and return them as JSON. Be precise and only return valid JSON. Always use the same language as the input transcript for action descriptions."},
             {"role": "user", "content": prompt}
         ],
@@ -157,7 +157,7 @@ Meeting Summary: {summary}"""
     )
 
     try:
-        actions_text = response.choices[0].message.content.strip()
+        actions_text = response.output_text.strip()
 
         # Extract JSON from markdown code blocks if present
         if "```json" in actions_text:
