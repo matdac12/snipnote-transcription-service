@@ -63,19 +63,19 @@ def download_audio(audio_url: str) -> bytes:
     return response.content
 
 
-def generate_overview(transcript: str) -> str:
-    """Generate 1-sentence meeting overview using GPT-4o"""
-    print(f"   📝 Generating overview...")
+def generate_overview(summary: str) -> str:
+    """Generate 1-sentence meeting overview using GPT-4o from summary"""
+    print(f"   📝 Generating overview from summary...")
 
-    prompt = f"""Identify the language spoken and always respond in the same language as the input transcript.
-Summarize this meeting transcript in exactly one short, clear sentence. Capture the main topic and key outcome or focus of the meeting.
+    prompt = f"""Identify the language spoken and always respond in the same language as the input.
+Summarize this meeting summary in exactly one short, clear sentence. Capture the main topic and key outcome or focus of the meeting.
 
 Examples:
 - "Team discussed Q4 goals and assigned project leads for upcoming initiatives."
 - "Budget review meeting where department heads presented spending proposals."
 - "Weekly standup covering project progress and addressing technical blockers."
 
-Meeting Transcript: {transcript}"""
+Meeting Summary: {summary}"""
 
     response = openai_client.chat.completions.create(
         model="gpt-4o",
@@ -130,12 +130,12 @@ Meeting Transcript: {transcript}"""
     return summary
 
 
-def extract_actions(transcript: str) -> list:
-    """Extract action items from transcript using GPT-4o"""
-    print(f"   ✅ Extracting actions...")
+def extract_actions(summary: str) -> list:
+    """Extract action items from summary using GPT-4o"""
+    print(f"   ✅ Extracting actions from summary...")
 
-    prompt = f"""Identify the language spoken and always respond in the same language as the input transcript.
-Extract actionable items from this transcript. For each action item, provide:
+    prompt = f"""Identify the language spoken and always respond in the same language as the input.
+Extract actionable items from this meeting summary. For each action item, provide:
 1. A clear, concise action description
 2. Priority level (HIGH, MED, LOW)
 
@@ -144,7 +144,7 @@ Return ONLY a JSON array with this exact format:
 
 If no actionable items exist, return an empty array: []
 
-Transcript: {transcript}"""
+Meeting Summary: {summary}"""
 
     response = openai_client.chat.completions.create(
         model="gpt-4o",
@@ -288,14 +288,21 @@ def process_chunked_job(job: Dict[str, Any]):
         print(f"   ✅ Merged transcript: {len(full_transcript)} chars")
 
         # Step 5: Generate AI content (70-90%)
-        update_job_progress(job_id, 70, "Generating overview...")
-        overview = generate_overview(full_transcript)
 
-        update_job_progress(job_id, 75, "Generating summary...")
+        # 5a: Summary (70-80%) - needs full transcript
+        update_job_progress(job_id, 70, "Generating summary...")
         summary = generate_summary(full_transcript)
+        update_job_progress(job_id, 80, "Summary generated")
 
+        # 5b: Overview (80-85%) - from summary
+        update_job_progress(job_id, 80, "Generating overview...")
+        overview = generate_overview(summary)
+        update_job_progress(job_id, 85, "Overview generated")
+
+        # 5c: Actions (85-90%) - from summary
         update_job_progress(job_id, 85, "Extracting actions...")
-        actions = extract_actions(full_transcript)
+        actions = extract_actions(summary)
+        update_job_progress(job_id, 90, "Actions extracted")
 
         # Step 6: Save results (90-100%)
         print(f"   💾 Saving all results to database...")
@@ -388,19 +395,19 @@ def process_job(job: Dict[str, Any]):
 
         # Step 4: Generate AI content (60-90%)
 
-        # 4a: Overview (60-70%)
-        update_job_progress(job_id, 60, "Generating overview...")
-        overview = generate_overview(transcript)
-        update_job_progress(job_id, 70, "Overview generated")
-
-        # 4b: Summary (70-80%)
-        update_job_progress(job_id, 70, "Generating summary...")
+        # 4a: Summary (60-75%) - needs full transcript
+        update_job_progress(job_id, 60, "Generating summary...")
         summary = generate_summary(transcript)
-        update_job_progress(job_id, 80, "Summary generated")
+        update_job_progress(job_id, 75, "Summary generated")
 
-        # 4c: Actions (80-90%)
-        update_job_progress(job_id, 80, "Extracting actions...")
-        actions = extract_actions(transcript)
+        # 4b: Overview (75-82%) - from summary
+        update_job_progress(job_id, 75, "Generating overview...")
+        overview = generate_overview(summary)
+        update_job_progress(job_id, 82, "Overview generated")
+
+        # 4c: Actions (82-90%) - from summary
+        update_job_progress(job_id, 82, "Extracting actions...")
+        actions = extract_actions(summary)
         update_job_progress(job_id, 90, "Actions extracted")
 
         # Step 5: Update job with all results and status='completed' (90-100%)
