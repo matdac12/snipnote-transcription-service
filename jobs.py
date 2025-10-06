@@ -64,7 +64,7 @@ def download_audio(audio_url: str) -> bytes:
 
 
 def generate_overview(summary: str) -> str:
-    """Generate 1-sentence meeting overview using GPT-4o from summary"""
+    """Generate 1-sentence meeting overview using GPT-5-mini from summary"""
     print(f"   📝 Generating overview from summary...")
 
     prompt = f"""Identify the language spoken and always respond in the same language as the input.
@@ -78,7 +78,7 @@ Examples:
 Meeting Summary: {summary}"""
 
     response = openai_client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-5-mini",
         messages=[
             {"role": "system", "content": "You create concise one-sentence meeting overviews. Always respond with exactly one clear, informative sentence in the same language as the input transcript."},
             {"role": "user", "content": prompt}
@@ -92,7 +92,7 @@ Meeting Summary: {summary}"""
 
 
 def generate_summary(transcript: str) -> str:
-    """Generate comprehensive meeting summary using GPT-4o"""
+    """Generate comprehensive meeting summary using GPT-5-mini"""
     print(f"   📄 Generating summary...")
 
     prompt = f"""Identify the language spoken and always respond in the same language as the input transcript.
@@ -117,7 +117,7 @@ Please create a comprehensive meeting summary from this transcript. Structure yo
 Meeting Transcript: {transcript}"""
 
     response = openai_client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-5-mini",
         messages=[
             {"role": "system", "content": "You are a professional meeting summarizer. Create structured, comprehensive summaries that capture key decisions, action items, and next steps. Always respond in the same language as the input transcript."},
             {"role": "user", "content": prompt}
@@ -131,7 +131,7 @@ Meeting Transcript: {transcript}"""
 
 
 def extract_actions(summary: str) -> list:
-    """Extract action items from summary using GPT-4o"""
+    """Extract action items from summary using GPT-5-mini"""
     print(f"   ✅ Extracting actions from summary...")
 
     prompt = f"""Identify the language spoken and always respond in the same language as the input.
@@ -147,7 +147,7 @@ If no actionable items exist, return an empty array: []
 Meeting Summary: {summary}"""
 
     response = openai_client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-5-mini",
         messages=[
             {"role": "system", "content": "You extract actionable items from text and return them as JSON. Be precise and only return valid JSON. Always use the same language as the input transcript for action descriptions."},
             {"role": "user", "content": prompt}
