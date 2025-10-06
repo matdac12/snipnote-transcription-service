@@ -84,10 +84,15 @@ Meeting Summary: {summary}"""
             {"role": "user", "content": prompt}
         ],
         reasoning={"effort": "minimal"},
-        verbosity="low"
+        text={"verbosity": "low"}
     )
 
-    overview = response.output_text.strip()
+    # Find the message output (reasoning output doesn't have content)
+    message_output = next((item for item in response.output if item.type == "message"), None)
+    if not message_output or not message_output.content:
+        raise Exception("No message content in response")
+
+    overview = message_output.content[0].text.strip()
     print(f"   ✅ Overview generated: {overview[:80]}...")
     return overview
 
@@ -123,10 +128,16 @@ Meeting Transcript: {transcript}"""
             {"role": "system", "content": "You are a professional meeting summarizer. Create structured, comprehensive summaries that capture key decisions, action items, and next steps. Always respond in the same language as the input transcript."},
             {"role": "user", "content": prompt}
         ],
-        reasoning={"effort": "minimal"}
+        reasoning={"effort": "minimal"},
+        text={"verbosity": "low"}
     )
 
-    summary = response.output_text
+    # Find the message output (reasoning output doesn't have content)
+    message_output = next((item for item in response.output if item.type == "message"), None)
+    if not message_output or not message_output.content:
+        raise Exception("No message content in response")
+
+    summary = message_output.content[0].text
     print(f"   ✅ Summary generated ({len(summary)} chars)")
     return summary
 
@@ -157,7 +168,12 @@ Meeting Summary: {summary}"""
     )
 
     try:
-        actions_text = response.output_text.strip()
+        # Find the message output (reasoning output doesn't have content)
+        message_output = next((item for item in response.output if item.type == "message"), None)
+        if not message_output or not message_output.content:
+            raise Exception("No message content in response")
+
+        actions_text = message_output.content[0].text.strip()
 
         # Extract JSON from markdown code blocks if present
         if "```json" in actions_text:
