@@ -24,7 +24,8 @@ def create_job(
     audio_url: str | None = None,
     is_chunked: bool = False,
     total_chunks: int = 1,
-    duration: float | None = None
+    duration: float | None = None,
+    language: str | None = None
 ) -> Dict[str, Any]:
     """
     Create a new transcription job with status='pending'
@@ -36,6 +37,7 @@ def create_job(
         is_chunked: Whether this is a chunked upload job
         total_chunks: Total number of audio chunks (for chunked jobs)
         duration: Total audio duration in seconds (for chunked jobs)
+        language: ISO-639-1 language code (e.g., "en", "it"). None for auto-detect
 
     Returns:
         Dict containing the created job data including job_id
@@ -60,6 +62,10 @@ def create_job(
         # Add duration if provided (for chunked jobs)
         if duration:
             data["duration"] = duration
+
+        # Add language if provided (for explicit language specification)
+        if language:
+            data["language"] = language
 
         response = supabase.table("transcription_jobs").insert(data).execute()
 

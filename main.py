@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends
+from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
@@ -43,6 +43,7 @@ class CreateJobRequest(BaseModel):
     is_chunked: bool = False
     total_chunks: int = 1
     duration: float | None = None
+    language: str | None = None  # ISO-639-1 code (e.g., "en", "it"). None for auto-detect
 
 
 class CreateJobResponse(BaseModel):
@@ -62,6 +63,7 @@ class JobStatusResponse(BaseModel):
     summary: str | None = None        # AI-generated full summary
     actions: list | None = None       # AI-extracted action items
     duration: float | None = None
+    language: str | None = None       # ISO-639-1 code used for transcription
     error_message: str | None = None
     progress_percentage: int = 0      # Progress from 0-100
     current_stage: str | None = None  # Human-readable stage description
@@ -106,7 +108,8 @@ async def create_transcription_job(
             audio_url=request.audio_url,
             is_chunked=request.is_chunked,
             total_chunks=request.total_chunks,
-            duration=request.duration
+            duration=request.duration,
+            language=request.language
         )
 
         return CreateJobResponse(
@@ -142,13 +145,16 @@ async def get_job_status(
 
 
 @app.post("/transcribe")
-async def transcribe(file: UploadFile = File(...)):
+async def transcribe(
+    file: UploadFile = File(...),
+    language: str | None = Form(None)  # Optional ISO-639-1 code (e.g., "en", "it")
+):
     try:
         # Read audio file
         audio_data = await file.read()
 
-        # Transcribe
-        result = transcribe_audio(audio_data, file.filename)
+        # Transcribe (language=None means auto-detect)
+        result = transcribe_audio(audio_data, file.filename, language=language)
 
         return result
     except Exception as e:

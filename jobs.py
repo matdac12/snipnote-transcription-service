@@ -244,6 +244,7 @@ def process_chunked_job(job: Dict[str, Any]):
     job_id = job["id"]
     meeting_id = job["meeting_id"]
     total_chunks = job.get("total_chunks", 0)
+    language = job.get("language")  # None if not specified (auto-detect)
 
     try:
         # Step 1: Update status to 'processing'
@@ -284,7 +285,7 @@ def process_chunked_job(job: Dict[str, Any]):
 
             # Transcribe chunk
             print(f"   🎤 Transcribing chunk {chunk_index + 1}/{len(chunks)}...")
-            result = transcribe_audio(chunk_data, f"chunk_{chunk_index}.m4a")
+            result = transcribe_audio(chunk_data, f"chunk_{chunk_index}.m4a", language=language)
             transcript = result["transcript"]
 
             # Save transcript to chunk
@@ -378,6 +379,7 @@ def process_job(job: Dict[str, Any]):
 
     # Regular (non-chunked) job processing
     audio_url = job["audio_url"]
+    language = job.get("language")  # None if not specified (auto-detect)
 
     try:
         # Step 1: Update status to 'processing' and set initial progress
@@ -402,7 +404,8 @@ def process_job(job: Dict[str, Any]):
         result = transcribe_audio(
             audio_data,
             "audio.m4a",
-            progress_callback=transcription_progress
+            progress_callback=transcription_progress,
+            language=language
         )
 
         transcript = result["transcript"]

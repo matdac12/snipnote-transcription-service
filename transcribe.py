@@ -145,15 +145,17 @@ def merge_transcripts(transcripts: List[str]) -> str:
 def transcribe_audio(
     audio_data: bytes,
     filename: str,
-    progress_callback: Optional[Callable] = None
+    progress_callback: Optional[Callable] = None,
+    language: Optional[str] = None
 ) -> dict:
     """
-    Transcribe audio using OpenAI Whisper with automatic chunking for large files
+    Transcribe audio using OpenAI gpt-4o-transcribe with automatic chunking for large files
 
     Args:
         audio_data: Raw audio file bytes
         filename: Original filename
         progress_callback: Optional callback(progress_pct: float, stage: str)
+        language: ISO-639-1 language code (e.g., "en", "it"). None for auto-detect
 
     Returns:
         Dict with 'transcript' and 'duration' keys
@@ -171,10 +173,15 @@ def transcribe_audio(
         audio_file = io.BytesIO(audio_data)
         audio_file.name = filename
 
-        transcript_response = client.audio.transcriptions.create(
-            model="gpt-4o-transcribe",
-            file=audio_file
-        )
+        # Build API kwargs - only include language if specified
+        api_kwargs = {
+            "model": "gpt-4o-transcribe",
+            "file": audio_file
+        }
+        if language:
+            api_kwargs["language"] = language
+
+        transcript_response = client.audio.transcriptions.create(**api_kwargs)
 
         # Calculate duration (rough estimate)
         duration = len(audio_data) / 32000
@@ -217,10 +224,15 @@ def transcribe_audio(
 
             # Transcribe chunk
             try:
-                transcript_response = client.audio.transcriptions.create(
-                    model="gpt-4o-transcribe",
-                    file=chunk_file
-                )
+                # Build API kwargs - only include language if specified
+                api_kwargs = {
+                    "model": "gpt-4o-transcribe",
+                    "file": chunk_file
+                }
+                if language:
+                    api_kwargs["language"] = language
+
+                transcript_response = client.audio.transcriptions.create(**api_kwargs)
                 transcripts.append(transcript_response.text)
                 print(f"   ✅ Chunk {chunk_num} transcribed: {len(transcript_response.text)} chars")
             except Exception as e:
