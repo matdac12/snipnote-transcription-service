@@ -1,10 +1,67 @@
 import os
 import io
+import time
 from typing import Callable, Optional, List
+from functools import wraps
 from openai import OpenAI
 from pydub import AudioSegment
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+def retry_with_backoff(max_retries: int = 3, base_delay: float = 1.0):
+    """
+    Decorator for retrying functions with exponential backoff.
+
+    Args:
+        max_retries: Maximum number of retry attempts
+        base_delay: Base delay in seconds (doubles each retry)
+    """
+    def decorator(func: Callable):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        print(f"   ⚠️ Retry {attempt + 1}/{max_retries} for {func.__name__} after {delay:.1f}s: {e}")
+                        time.sleep(delay)
+                    else:
+                        print(f"   ❌ {func.__name__} failed after {max_retries} attempts: {e}")
+            raise last_exception
+        return wrapper
+    return decorator
+
+
+@retry_with_backoff(max_retries=3, base_delay=2.0)
+def transcribe_chunk_with_retry(chunk_bytes: bytes, chunk_name: str, language: Optional[str] = None) -> str:
+    """
+    Transcribe a single audio chunk with retry logic.
+
+    Args:
+        chunk_bytes: Audio chunk bytes
+        chunk_name: Name for the chunk file
+        language: Optional language code
+
+    Returns:
+        Transcript text
+    """
+    chunk_file = io.BytesIO(chunk_bytes)
+    chunk_file.name = chunk_name
+
+    api_kwargs = {
+        "model": "gpt-4o-transcribe",
+        "file": chunk_file
+    }
+    if language:
+        api_kwargs["language"] = language
+
+    response = client.audio.transcriptions.create(**api_kwargs)
+    return response.text
 
 # Constants matching iOS implementation
 MAX_CHUNK_SIZE_MB = 1.5
@@ -170,18 +227,8 @@ def transcribe_audio(
         if progress_callback:
             progress_callback(0, "Transcribing audio...")
 
-        audio_file = io.BytesIO(audio_data)
-        audio_file.name = filename
-
-        # Build API kwargs - only include language if specified
-        api_kwargs = {
-            "model": "gpt-4o-transcribe",
-            "file": audio_file
-        }
-        if language:
-            api_kwargs["language"] = language
-
-        transcript_response = client.audio.transcriptions.create(**api_kwargs)
+        # Use retry-enabled transcription
+        transcript_text = transcribe_chunk_with_retry(audio_data, filename, language)
 
         # Calculate duration (rough estimate)
         duration = len(audio_data) / 32000
@@ -190,7 +237,7 @@ def transcribe_audio(
             progress_callback(100, "Transcription complete")
 
         return {
-            "transcript": transcript_response.text,
+            "transcript": transcript_text,
             "duration": duration
         }
 
@@ -218,26 +265,18 @@ def transcribe_audio(
 
             print(f"   🎤 Transcribing chunk {chunk_num}/{total_chunks} ({len(chunk_bytes) / 1024 / 1024:.2f} MB)")
 
-            # Create file-like object for this chunk
-            chunk_file = io.BytesIO(chunk_bytes)
-            chunk_file.name = f"chunk_{chunk_num}.mp3"
-
-            # Transcribe chunk
+            # Transcribe chunk with retry logic
             try:
-                # Build API kwargs - only include language if specified
-                api_kwargs = {
-                    "model": "gpt-4o-transcribe",
-                    "file": chunk_file
-                }
-                if language:
-                    api_kwargs["language"] = language
-
-                transcript_response = client.audio.transcriptions.create(**api_kwargs)
-                transcripts.append(transcript_response.text)
-                print(f"   ✅ Chunk {chunk_num} transcribed: {len(transcript_response.text)} chars")
+                transcript_text = transcribe_chunk_with_retry(
+                    chunk_bytes,
+                    f"chunk_{chunk_num}.mp3",
+                    language
+                )
+                transcripts.append(transcript_text)
+                print(f"   ✅ Chunk {chunk_num} transcribed: {len(transcript_text)} chars")
             except Exception as e:
-                print(f"   ❌ Chunk {chunk_num} failed: {e}")
-                raise  # Fail completely if any chunk fails
+                print(f"   ❌ Chunk {chunk_num} failed after retries: {e}")
+                raise  # Fail completely if any chunk fails after retries
 
         # Merge transcripts (progress: 90-100%)
         if progress_callback:
