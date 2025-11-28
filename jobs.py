@@ -15,9 +15,107 @@ from supabase_client import (
     update_job_progress,
     get_audio_chunks,
     update_chunk_transcript,
-    update_chunks_processed
+    update_chunks_processed,
+    increment_retry_count
 )
 from transcribe import transcribe_audio
+
+
+# Maximum retry attempts before permanent failure
+MAX_RETRY_ATTEMPTS = 5
+
+
+def is_retryable_error(error: Exception) -> bool:
+    """
+    Determine if an error is retryable (transient) or permanent.
+
+    Retryable errors include:
+    - Rate limits (429)
+    - Server errors (500, 502, 503, 504)
+    - Timeouts
+    - Connection errors
+
+    Permanent errors include:
+    - Invalid audio format
+    - Authentication failures (401, 403)
+    - Bad requests (400)
+    - File not found (404)
+
+    Args:
+        error: The exception to classify
+
+    Returns:
+        True if the error is retryable, False if permanent
+    """
+    error_str = str(error).lower()
+
+    # Retryable patterns - transient issues that may resolve on retry
+    retryable_patterns = [
+        "rate limit",
+        "rate_limit",
+        "429",
+        "too many requests",
+        "timeout",
+        "timed out",
+        "connection error",
+        "connection refused",
+        "connection reset",
+        "server error",
+        "internal server error",
+        "500",
+        "502",
+        "503",
+        "504",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "temporarily unavailable",
+        "overloaded",
+        "capacity",
+        "try again",
+        "retry",
+        "network",
+        "socket",
+        "eof",
+        "broken pipe",
+    ]
+
+    # Permanent patterns - errors that won't be fixed by retrying
+    permanent_patterns = [
+        "invalid audio",
+        "invalid file",
+        "unsupported format",
+        "could not decode",
+        "authentication",
+        "unauthorized",
+        "401",
+        "forbidden",
+        "403",
+        "not found",
+        "404",
+        "bad request",
+        "400",
+        "invalid_api_key",
+        "api key",
+        "permission denied",
+        "access denied",
+        "file too large",
+        "exceeds maximum",
+    ]
+
+    # Check for permanent errors first (they take priority)
+    for pattern in permanent_patterns:
+        if pattern in error_str:
+            return False
+
+    # Check for retryable errors
+    for pattern in retryable_patterns:
+        if pattern in error_str:
+            return True
+
+    # Default: treat unknown errors as retryable (safer)
+    # This ensures we don't permanently fail on unexpected transient issues
+    return True
 
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -440,13 +538,27 @@ def process_chunked_job(job: Dict[str, Any]):
         print(f"   - Actions: {len(actions)} items")
 
     except Exception as e:
+        # Error handling: classify error and decide whether to retry or fail permanently
         error_message = str(e)
-        print(f"❌ Chunked job {job_id} failed: {error_message}")
+        retry_count = job.get("retry_count", 0) or 0
 
         try:
-            update_job_status(job_id=job_id, status="failed", error=error_message)
-            update_job_progress(job_id, 0, f"Failed: {error_message[:50]}...")
-            print(f"   💾 Error saved to database")
+            if is_retryable_error(e) and retry_count < MAX_RETRY_ATTEMPTS:
+                # Retryable error - queue for retry
+                print(f"🔄 Chunked job {job_id} failed with retryable error (attempt {retry_count + 1}/{MAX_RETRY_ATTEMPTS}): {error_message}")
+                increment_retry_count(job_id, error_message)
+                print(f"   📋 Job queued for retry on next cron run")
+            else:
+                # Permanent error or max retries exceeded
+                if retry_count >= MAX_RETRY_ATTEMPTS:
+                    print(f"❌ Chunked job {job_id} failed permanently after {MAX_RETRY_ATTEMPTS} attempts: {error_message}")
+                    error_message = f"Max retries ({MAX_RETRY_ATTEMPTS}) exceeded. Last error: {error_message}"
+                else:
+                    print(f"❌ Chunked job {job_id} failed with permanent error: {error_message}")
+
+                update_job_status(job_id=job_id, status="failed", error=error_message)
+                update_job_progress(job_id, 0, f"Failed: {error_message[:50]}...")
+                print(f"   💾 Error saved to database")
         except Exception as update_error:
             print(f"   ⚠️  Failed to update job status: {update_error}")
 
@@ -546,18 +658,31 @@ def process_job(job: Dict[str, Any]):
         print(f"   - Actions: {len(actions)} items")
 
     except Exception as e:
-        # Error handling: update job status to 'failed' with error message
+        # Error handling: classify error and decide whether to retry or fail permanently
         error_message = str(e)
-        print(f"❌ Job {job_id} failed: {error_message}")
+        retry_count = job.get("retry_count", 0) or 0
 
         try:
-            update_job_status(
-                job_id=job_id,
-                status="failed",
-                error=error_message
-            )
-            update_job_progress(job_id, 0, f"Failed: {error_message[:50]}...")
-            print(f"   💾 Error saved to database")
+            if is_retryable_error(e) and retry_count < MAX_RETRY_ATTEMPTS:
+                # Retryable error - queue for retry
+                print(f"🔄 Job {job_id} failed with retryable error (attempt {retry_count + 1}/{MAX_RETRY_ATTEMPTS}): {error_message}")
+                increment_retry_count(job_id, error_message)
+                print(f"   📋 Job queued for retry on next cron run")
+            else:
+                # Permanent error or max retries exceeded
+                if retry_count >= MAX_RETRY_ATTEMPTS:
+                    print(f"❌ Job {job_id} failed permanently after {MAX_RETRY_ATTEMPTS} attempts: {error_message}")
+                    error_message = f"Max retries ({MAX_RETRY_ATTEMPTS}) exceeded. Last error: {error_message}"
+                else:
+                    print(f"❌ Job {job_id} failed with permanent error: {error_message}")
+
+                update_job_status(
+                    job_id=job_id,
+                    status="failed",
+                    error=error_message
+                )
+                update_job_progress(job_id, 0, f"Failed: {error_message[:50]}...")
+                print(f"   💾 Error saved to database")
         except Exception as update_error:
             print(f"   ⚠️  Failed to update job status: {update_error}")
 

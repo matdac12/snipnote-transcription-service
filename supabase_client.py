@@ -346,3 +346,48 @@ def update_chunks_processed(job_id: str, chunks_processed: int) -> Dict[str, Any
     except Exception as e:
         print(f"❌ Error updating chunks_processed for job {job_id}: {e}")
         raise
+
+
+def increment_retry_count(job_id: str, error_message: str) -> Dict[str, Any]:
+    """
+    Increment the retry count for a job and reset status to pending for retry.
+
+    Args:
+        job_id: UUID of the job to update
+        error_message: Error message from the failed attempt
+
+    Returns:
+        Dict containing updated job data
+
+    Raises:
+        Exception: If update fails
+    """
+    try:
+        # First get current retry count
+        job = get_job(job_id)
+        if not job:
+            raise Exception(f"Job {job_id} not found")
+
+        current_retry = job.get("retry_count", 0) or 0
+        new_retry_count = current_retry + 1
+
+        update_data = {
+            "retry_count": new_retry_count,
+            "status": "pending",  # Reset to pending for next cron run
+            "error_message": f"Retry {new_retry_count}: {error_message}",
+            "progress_percentage": 0,
+            "current_stage": f"Waiting for retry ({new_retry_count}/5)..."
+        }
+
+        response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).execute()
+
+        if response.data and len(response.data) > 0:
+            job = response.data[0]
+            print(f"🔄 Job {job_id} queued for retry (attempt {new_retry_count}/5)")
+            return job
+        else:
+            raise Exception(f"Failed to increment retry count for job {job_id}: No data returned")
+
+    except Exception as e:
+        print(f"❌ Error incrementing retry count for job {job_id}: {e}")
+        raise
