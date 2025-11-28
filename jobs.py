@@ -3,7 +3,10 @@ import io
 import json
 import os
 import asyncio
-from typing import List, Dict, Any
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Any, Callable
+from functools import wraps
 from openai import OpenAI
 from supabase_client import (
     supabase,
@@ -18,6 +21,37 @@ from transcribe import transcribe_audio
 
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+# Reusable HTTP client for connection pooling
+http_client = httpx.Client(timeout=120.0)
+
+
+def retry_with_backoff(max_retries: int = 3, base_delay: float = 1.0):
+    """
+    Decorator for retrying functions with exponential backoff
+
+    Args:
+        max_retries: Maximum number of retry attempts
+        base_delay: Base delay in seconds (doubles each retry)
+    """
+    def decorator(func: Callable):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        print(f"   ⚠️ Retry {attempt + 1}/{max_retries} for {func.__name__} after {delay:.1f}s: {e}")
+                        time.sleep(delay)
+                    else:
+                        print(f"   ❌ {func.__name__} failed after {max_retries} attempts: {e}")
+            raise last_exception
+        return wrapper
+    return decorator
 
 
 def get_pending_jobs() -> List[Dict[str, Any]]:
@@ -43,7 +77,7 @@ def get_pending_jobs() -> List[Dict[str, Any]]:
 
 def download_audio(audio_url: str) -> bytes:
     """
-    Download audio file from URL
+    Download audio file from URL using reusable HTTP client for connection pooling
 
     Args:
         audio_url: URL to audio file (Supabase Storage or public URL)
@@ -56,13 +90,14 @@ def download_audio(audio_url: str) -> bytes:
     """
     print(f"   📥 Downloading audio from {audio_url[:50]}...")
 
-    response = httpx.get(audio_url, timeout=120.0, follow_redirects=True)
+    response = http_client.get(audio_url, follow_redirects=True)
     response.raise_for_status()
 
     print(f"   ✅ Downloaded {len(response.content)} bytes")
     return response.content
 
 
+@retry_with_backoff(max_retries=3, base_delay=1.0)
 def generate_overview(summary: str) -> str:
     """Generate 1-sentence meeting overview using GPT-5-mini from summary"""
     print(f"   📝 Generating overview from summary...")
@@ -97,6 +132,7 @@ Meeting Summary: {summary}"""
     return overview
 
 
+@retry_with_backoff(max_retries=3, base_delay=1.0)
 def generate_summary(transcript: str) -> str:
     """Generate comprehensive meeting summary using GPT-5-mini"""
     print(f"   📄 Generating summary...")
@@ -142,6 +178,7 @@ Meeting Transcript: {transcript}"""
     return summary
 
 
+@retry_with_backoff(max_retries=3, base_delay=1.0)
 def extract_actions(summary: str) -> list:
     """Extract action items from summary using GPT-5-mini"""
     print(f"   ✅ Extracting actions from summary...")
@@ -234,6 +271,44 @@ def download_chunk_from_storage(chunk_file_path: str) -> bytes:
         raise
 
 
+def process_single_chunk(chunk: Dict[str, Any], total_chunks: int, language: str = None) -> Dict[str, Any]:
+    """
+    Process a single audio chunk: download and transcribe.
+    Used by ThreadPoolExecutor for parallel processing.
+
+    Args:
+        chunk: Chunk dictionary with id, chunk_index, file_path
+        total_chunks: Total number of chunks (for logging)
+        language: Optional language code for transcription
+
+    Returns:
+        Dict with chunk_id, chunk_index, transcript
+    """
+    chunk_id = chunk["id"]
+    chunk_index = chunk["chunk_index"]
+    file_path = chunk["file_path"]
+
+    try:
+        # Download chunk from storage
+        chunk_data = download_chunk_from_storage(file_path)
+
+        # Transcribe chunk
+        print(f"   🎤 Transcribing chunk {chunk_index + 1}/{total_chunks}...")
+        result = transcribe_audio(chunk_data, f"chunk_{chunk_index}.m4a", language=language)
+        transcript = result["transcript"]
+
+        print(f"   ✅ Chunk {chunk_index + 1}/{total_chunks} transcribed ({len(transcript)} chars)")
+
+        return {
+            "chunk_id": chunk_id,
+            "chunk_index": chunk_index,
+            "transcript": transcript
+        }
+    except Exception as e:
+        print(f"   ❌ Chunk {chunk_index + 1}/{total_chunks} failed: {e}")
+        raise
+
+
 def process_chunked_job(job: Dict[str, Any]):
     """
     Process a chunked transcription job
@@ -263,41 +338,55 @@ def process_chunked_job(job: Dict[str, Any]):
         if len(chunks) != total_chunks:
             print(f"   ⚠️ Expected {total_chunks} chunks, found {len(chunks)}")
 
-        # Step 3: Process each chunk (5-70% total progress)
-        transcripts = []
-        progress_per_chunk = 65 / len(chunks)  # 65% of total progress for transcription
+        # Step 3: Process chunks in PARALLEL (5-70% total progress)
+        # Using ThreadPoolExecutor for 5-10x speedup on chunked jobs
+        print(f"   🚀 Processing {len(chunks)} chunks in parallel (max 5 workers)...")
+        update_job_progress(job_id, 10, f"Transcribing {len(chunks)} chunks in parallel...")
 
-        for i, chunk in enumerate(chunks):
-            chunk_id = chunk["id"]
-            chunk_index = chunk["chunk_index"]
-            file_path = chunk["file_path"]
+        # Track results by chunk_index to maintain order
+        chunk_results: Dict[int, str] = {}
+        completed_count = 0
 
-            # Update progress
-            current_progress = 5 + int((i / len(chunks)) * 65)
-            update_job_progress(
-                job_id,
-                current_progress,
-                f"Transcribing chunk {chunk_index + 1}/{len(chunks)}..."
-            )
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            # Submit all chunks for parallel processing
+            future_to_chunk = {
+                executor.submit(process_single_chunk, chunk, len(chunks), language): chunk
+                for chunk in chunks
+            }
 
-            # Download chunk from storage
-            chunk_data = download_chunk_from_storage(file_path)
+            # Process completed chunks as they finish
+            for future in as_completed(future_to_chunk):
+                chunk = future_to_chunk[future]
+                try:
+                    result = future.result()
+                    chunk_id = result["chunk_id"]
+                    chunk_index = result["chunk_index"]
+                    transcript = result["transcript"]
 
-            # Transcribe chunk
-            print(f"   🎤 Transcribing chunk {chunk_index + 1}/{len(chunks)}...")
-            result = transcribe_audio(chunk_data, f"chunk_{chunk_index}.m4a", language=language)
-            transcript = result["transcript"]
+                    # Save transcript to database
+                    update_chunk_transcript(chunk_id, transcript)
 
-            # Save transcript to chunk
-            update_chunk_transcript(chunk_id, transcript)
+                    # Store result by index for ordered merging later
+                    chunk_results[chunk_index] = transcript
 
-            # Add to transcripts list
-            transcripts.append(transcript)
+                    # Update progress
+                    completed_count += 1
+                    current_progress = 5 + int((completed_count / len(chunks)) * 65)
+                    update_job_progress(
+                        job_id,
+                        current_progress,
+                        f"Transcribed {completed_count}/{len(chunks)} chunks..."
+                    )
+                    update_chunks_processed(job_id, completed_count)
 
-            # Update chunks_processed count
-            update_chunks_processed(job_id, i + 1)
+                except Exception as e:
+                    chunk_index = chunk.get("chunk_index", "?")
+                    print(f"   ❌ Chunk {chunk_index} failed: {e}")
+                    raise
 
-            print(f"   ✅ Chunk {chunk_index + 1}/{len(chunks)} transcribed ({len(transcript)} chars)")
+        # Build ordered transcripts list from results
+        transcripts = [chunk_results[i] for i in sorted(chunk_results.keys())]
+        print(f"   ✅ All {len(transcripts)} chunks transcribed in parallel")
 
         # Step 4: Merge transcripts (70%)
         print(f"   🔗 Merging {len(transcripts)} chunk transcripts...")
@@ -307,20 +396,23 @@ def process_chunked_job(job: Dict[str, Any]):
 
         # Step 5: Generate AI content (70-90%)
 
-        # 5a: Summary (70-80%) - needs full transcript
+        # 5a: Summary (70-80%) - needs full transcript, must run first
         update_job_progress(job_id, 70, "Generating summary...")
         summary = generate_summary(full_transcript)
         update_job_progress(job_id, 80, "Summary generated")
 
-        # 5b: Overview (80-85%) - from summary
-        update_job_progress(job_id, 80, "Generating overview...")
-        overview = generate_overview(summary)
-        update_job_progress(job_id, 85, "Overview generated")
+        # 5b: Overview + Actions in PARALLEL (80-90%) - both only need summary
+        print(f"   🚀 Generating overview and actions in parallel...")
+        update_job_progress(job_id, 80, "Generating overview and extracting actions...")
 
-        # 5c: Actions (85-90%) - from summary
-        update_job_progress(job_id, 85, "Extracting actions...")
-        actions = extract_actions(summary)
-        update_job_progress(job_id, 90, "Actions extracted")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            overview_future = executor.submit(generate_overview, summary)
+            actions_future = executor.submit(extract_actions, summary)
+
+            overview = overview_future.result()
+            actions = actions_future.result()
+
+        update_job_progress(job_id, 90, "AI content generated")
 
         # Step 6: Save results (90-100%)
         print(f"   💾 Saving all results to database...")
@@ -415,20 +507,23 @@ def process_job(job: Dict[str, Any]):
 
         # Step 4: Generate AI content (60-90%)
 
-        # 4a: Summary (60-75%) - needs full transcript
+        # 4a: Summary (60-75%) - needs full transcript, must run first
         update_job_progress(job_id, 60, "Generating summary...")
         summary = generate_summary(transcript)
         update_job_progress(job_id, 75, "Summary generated")
 
-        # 4b: Overview (75-82%) - from summary
-        update_job_progress(job_id, 75, "Generating overview...")
-        overview = generate_overview(summary)
-        update_job_progress(job_id, 82, "Overview generated")
+        # 4b: Overview + Actions in PARALLEL (75-90%) - both only need summary
+        print(f"   🚀 Generating overview and actions in parallel...")
+        update_job_progress(job_id, 75, "Generating overview and extracting actions...")
 
-        # 4c: Actions (82-90%) - from summary
-        update_job_progress(job_id, 82, "Extracting actions...")
-        actions = extract_actions(summary)
-        update_job_progress(job_id, 90, "Actions extracted")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            overview_future = executor.submit(generate_overview, summary)
+            actions_future = executor.submit(extract_actions, summary)
+
+            overview = overview_future.result()
+            actions = actions_future.result()
+
+        update_job_progress(job_id, 90, "AI content generated")
 
         # Step 5: Update job with all results and status='completed' (90-100%)
         print(f"   💾 Saving all results to database...")
