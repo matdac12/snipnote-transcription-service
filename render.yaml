@@ -22,7 +22,7 @@ services:
   - type: cron
     name: snipnote-transcription-worker
     env: python
-    schedule: "* * * * *"  # Run every 1 minute for faster response
+    schedule: "0 0 * * *"  # Daily at midnight (safety net, jobs are triggered on-demand via Supabase trigger)
     buildCommand: |
       chmod +x install_ffmpeg.sh
       ./install_ffmpeg.sh
