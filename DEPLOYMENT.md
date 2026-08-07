@@ -41,15 +41,43 @@ systemctl daemon-reload
 systemctl enable --now snipnote-api snipnote-worker
 
 cp deploy/nginx-snipnote-api.conf /etc/nginx/sites-available/snipnote-api
+cp deploy/00-default-deny.conf /etc/nginx/sites-available/00-default-deny
 ln -sf /etc/nginx/sites-available/snipnote-api /etc/nginx/sites-enabled/snipnote-api
+ln -sf /etc/nginx/sites-available/00-default-deny /etc/nginx/sites-enabled/00-default-deny
 nginx -t && systemctl reload nginx
+
+# Open the web ports (this box otherwise keeps 80/443 closed — see below)
+ufw allow 80/tcp && ufw allow 443/tcp
 
 # TLS — requires api.snipnote.app to already resolve to this box
 apt-get install -y certbot python3-certbot-nginx
-certbot --nginx -d api.snipnote.app --non-interactive --agree-tos -m <your-email>
+certbot --nginx -d api.snipnote.app --non-interactive --agree-tos -m <your-email> --redirect
 ```
 
 `certbot` installs a systemd timer that handles renewal automatically.
+
+### Two traps specific to this box
+
+**1. nginx cannot bind `0.0.0.0:443`.** `tailscaled` already listens on `:443` on the
+Tailscale addresses, so certbot's default `listen 443 ssl;` fails with
+`bind() to 0.0.0.0:443 failed (98: Address already in use)` — and nginx silently keeps
+serving only port 80. After the first certbot run, edit
+`/etc/nginx/sites-available/snipnote-api`: delete the `listen [::]:443` line and change
+`listen 443 ssl;` to `listen 62.238.24.246:443 ssl;`, then `systemctl restart nginx`
+(a reload is not enough to pick up new listen sockets after a failed bind). Verify with
+`ss -tlnp | grep nginx`.
+
+**2. Opening 80/443 exposes every other vhost.** Before this migration, ufw denied both
+ports and everything was reached through the Cloudflare Tunnel. The `whatsapp-omni` vhost
+was `default_server`, so opening the ports would have published the Omni assistant to the
+internet. This is now prevented by `00-default-deny.conf` plus explicit
+`server_name` + `allow 127.0.0.1; allow ::1; deny all;` on the tunnel-only vhosts. If you
+add a new vhost here, keep that pattern. Check it still holds with:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" http://<public-ip>/                                  # want 000
+curl -s -o /dev/null -w "%{http_code}\n" -H "Host: api.bedigital-omni.com" http://<public-ip>/ # want 403
+```
 
 ### Deploying a change
 
