@@ -8,6 +8,11 @@ from pydub import AudioSegment
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# Transcription model. gpt-transcribe is 25% cheaper than gpt-4o-transcribe
+# ($0.0045/min vs $0.006/min) and more accurate on multi-speaker audio.
+# Override with TRANSCRIPTION_MODEL to roll back without a code change.
+TRANSCRIPTION_MODEL = os.getenv("TRANSCRIPTION_MODEL", "gpt-transcribe")
+
 
 def retry_with_backoff(max_retries: int = 3, base_delay: float = 1.0):
     """
@@ -54,7 +59,7 @@ def transcribe_chunk_with_retry(chunk_bytes: bytes, chunk_name: str, language: O
     chunk_file.name = chunk_name
 
     api_kwargs = {
-        "model": "gpt-4o-transcribe",
+        "model": TRANSCRIPTION_MODEL,
         "file": chunk_file
     }
     if language:
@@ -206,7 +211,7 @@ def transcribe_audio(
     language: Optional[str] = None
 ) -> dict:
     """
-    Transcribe audio using OpenAI gpt-4o-transcribe with automatic chunking for large files
+    Transcribe audio using TRANSCRIPTION_MODEL with automatic chunking for large files
 
     Args:
         audio_data: Raw audio file bytes

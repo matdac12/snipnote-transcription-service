@@ -1,6 +1,8 @@
 # SnipNote Transcription Service
 
-Server-side audio transcription using OpenAI Whisper API.
+Server-side audio transcription using the OpenAI `gpt-transcribe` API.
+
+Deployed on the `omni` VPS at `https://api.snipnote.app` — see [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Local Development
 

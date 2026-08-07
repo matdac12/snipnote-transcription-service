@@ -1,0 +1,22 @@
+[Unit]
+Description=SnipNote Transcription Worker (continuous poller)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/snipnote-transcription
+EnvironmentFile=/etc/snipnote-transcription/env
+ExecStart=/opt/snipnote-transcription/.venv/bin/python worker.py --continuous
+Restart=always
+RestartSec=10
+# Cap the audio-processing path so a pathological job is killed here rather than
+# letting the kernel OOM killer pick a victim among the other services on this box.
+MemoryMax=1500M
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

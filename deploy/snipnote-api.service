@@ -1,0 +1,21 @@
+[Unit]
+Description=SnipNote Transcription API (uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/snipnote-transcription
+EnvironmentFile=/etc/snipnote-transcription/env
+ExecStart=/opt/snipnote-transcription/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8100
+Restart=on-failure
+RestartSec=5
+# The API only writes DB rows; the worker does the heavy lifting.
+MemoryMax=512M
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

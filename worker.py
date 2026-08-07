@@ -27,6 +27,9 @@ warnings.filterwarnings("ignore", category=SyntaxWarning, module="pydub")
 # With 2GB RAM, you can safely handle 3-5 concurrent jobs
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "3"))
 
+# Seconds between polls in continuous mode
+WORKER_INTERVAL_SECONDS = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
+
 
 def run_once():
     """
@@ -38,7 +41,7 @@ def run_once():
     print("✅ Worker finished\n")
 
 
-def run_continuous(interval_seconds: int = 60):
+def run_continuous(interval_seconds: int = WORKER_INTERVAL_SECONDS):
     """
     Run worker continuously: check for pending jobs every N seconds
 
@@ -61,8 +64,8 @@ def run_continuous(interval_seconds: int = 60):
 if __name__ == "__main__":
     # Check command line arguments
     if len(sys.argv) > 1 and sys.argv[1] == "--continuous":
-        # Continuous mode for local testing
-        run_continuous(interval_seconds=60)
+        # Continuous mode (used by the VPS systemd service, and for local testing)
+        run_continuous()
     else:
         # Single run mode for cron job
         run_once()

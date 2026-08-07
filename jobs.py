@@ -24,6 +24,11 @@ from transcribe import transcribe_audio
 # Maximum retry attempts before permanent failure
 MAX_RETRY_ATTEMPTS = 5
 
+# How many chunks of a single job to transcribe in parallel. Each worker holds a
+# decoded chunk in memory, so this is the main lever on peak RAM — lower it on
+# small hosts (see MEMORY_OPTIMIZATION_PLAN.md).
+MAX_CHUNK_WORKERS = int(os.getenv("MAX_CHUNK_WORKERS", "5"))
+
 
 def is_retryable_error(error: Exception) -> bool:
     """
@@ -438,14 +443,14 @@ def process_chunked_job(job: Dict[str, Any]):
 
         # Step 3: Process chunks in PARALLEL (5-70% total progress)
         # Using ThreadPoolExecutor for 5-10x speedup on chunked jobs
-        print(f"   🚀 Processing {len(chunks)} chunks in parallel (max 5 workers)...")
+        print(f"   🚀 Processing {len(chunks)} chunks in parallel (max {MAX_CHUNK_WORKERS} workers)...")
         update_job_progress(job_id, 10, f"Transcribing {len(chunks)} chunks in parallel...")
 
         # Track results by chunk_index to maintain order
         chunk_results: Dict[int, str] = {}
         completed_count = 0
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=MAX_CHUNK_WORKERS) as executor:
             # Submit all chunks for parallel processing
             future_to_chunk = {
                 executor.submit(process_single_chunk, chunk, len(chunks), language): chunk
