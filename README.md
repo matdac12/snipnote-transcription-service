@@ -89,7 +89,7 @@ The `render.yaml` file automatically configures both the web service and cron wo
 
 ### Test Job Creation
 ```bash
-curl -X POST https://your-render-url.onrender.com/jobs \
+curl -X POST https://api.snipnote.app/jobs \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-api-key" \
   -d '{
@@ -101,6 +101,6 @@ curl -X POST https://your-render-url.onrender.com/jobs \
 
 ### Test Job Status
 ```bash
-curl -X GET https://your-render-url.onrender.com/jobs/{job_id} \
+curl -X GET https://api.snipnote.app/jobs/{job_id} \
   -H "X-API-Key: your-api-key"
 ```

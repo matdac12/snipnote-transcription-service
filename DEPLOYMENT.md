@@ -1,8 +1,8 @@
 # Deployment Instructions
 
-> **Primary host: the `omni` VPS** (`https://api.snipnote.app`).
-> Render is kept running only during the client cutover overlap — see
-> [Decommissioning Render](#decommissioning-render).
+> **Host: the `omni` VPS** (`https://api.snipnote.app`).
+> Migrated off Render in Aug 2026; the Render services have been suspended and
+> `render.yaml` removed. Git history has the old Blueprint if it is ever needed.
 
 ## 🖥️ VPS Deployment (primary)
 
@@ -115,70 +115,13 @@ apps. `MAX_CONCURRENT_JOBS=1` and `MAX_CHUNK_WORKERS=2` (both below the code def
 restarted by systemd under load, `MEMORY_OPTIMIZATION_PLAN.md` describes the fully
 sequential rewrite as the next lever.
 
-### Decommissioning Render
+### Leftover from the Render era
 
-Once the App Store release pointing at `api.snipnote.app` has had a few weeks to roll out:
-
-1. Delete the Render web service and cron job.
-2. Delete `render.yaml` and the Render section below.
-3. Delete the Supabase **Database → Webhooks** entry that pokes the Render worker
-   on-demand — the continuous poller replaces it.
+The Supabase **Database → Webhooks** entry that used to poke the Render cron worker
+on job insert is now dead — the continuous poller replaces it. Delete it from the
+Supabase dashboard.
 
 ---
-
-## 🗄️ Render Deployment (legacy — remove after cutover)
-
-## ✅ Files Updated
-
-All Python backend files have been updated with full AI processing:
-
-- **main.py** - Added `overview`, `summary`, `actions` to `JobStatusResponse`
-- **jobs.py** - Added GPT-4o functions and updated `process_job()` pipeline
-- **supabase_client.py** - Added `update_job_with_results()` function
-- **requirements.txt** - Already has `openai==1.54.0` ✅
-
-## 🚀 Deployment Steps
-
-### 1. Add Environment Variable
-
-Before deploying, add this to your Render environment variables:
-
-```
-OPENAI_API_KEY=sk-your-actual-key-here
-```
-
-**How to add on Render:**
-1. Go to your Render dashboard
-2. Select the snipnote-transcription service
-3. Go to "Environment" tab
-4. Click "Add Environment Variable"
-5. Key: `OPENAI_API_KEY`
-6. Value: Your OpenAI API key
-7. Save changes
-
-### 2. Deploy Changes
-
-If using Git integration:
-```bash
-cd /Users/mattia/Documents/Projects/Xcodestuff/SnipNote/snipnote-transcription-service
-git add .
-git commit -m "feat: add server-side AI processing (overview, summary, actions)"
-git push origin main
-```
-
-Render will automatically detect the changes and redeploy.
-
-If manual deployment:
-1. Go to Render dashboard
-2. Select your service
-3. Click "Manual Deploy" → "Deploy latest commit"
-
-### 3. Verify Deployment
-
-After deployment, check the Render logs to see:
-```
-✅ Supabase client initialized
-```
 
 ## 📋 Complete AI Pipeline
 
@@ -186,9 +129,8 @@ When a job is processed, the worker now:
 
 1. **Download audio** from Supabase Storage
 2. **Transcription API** (`gpt-transcribe`) → Transcribe audio
-3. **GPT-4o** → Generate 1-sentence overview
-4. **GPT-4o** → Generate comprehensive summary
-5. **GPT-4o** → Extract action items
+3. **`gpt-5-mini`** → Generate comprehensive summary
+4. **`gpt-5-mini`** → Generate 1-sentence overview and extract action items (in parallel)
 6. **Update database** with all results (status=completed)
 
 ## 🧪 Testing
@@ -202,7 +144,7 @@ After deployment, test with a real audio file:
 4. Watch it navigate to MeetingDetailView
 5. Pull to refresh or wait 15 seconds for polling
 
-### Expected Logs (Render):
+### Expected Logs (`journalctl -u snipnote-worker -f`):
 ```
 🔄 Processing job abc-123...
    ⚙️  Updating status to 'processing'...
@@ -260,16 +202,16 @@ This ensures the overview, summary, and actions are generated in the same langua
 
 ## ⚠️ Important Notes
 
-- **Environment Variable**: Make sure `OPENAI_API_KEY` is set before deployment!
+- **Environment Variable**: Make sure `OPENAI_API_KEY` is set in `/etc/snipnote-transcription/env`
 - **Actions Format**: Stored as JSONB in database, converted to iOS `Action` objects automatically
 - **Error Handling**: If AI generation fails, the job will fail (not partial completion)
-- **Cron Frequency**: Worker runs every 1-2 minutes (check `render.yaml`)
+- **Poll Frequency**: Worker checks for pending jobs every `WORKER_INTERVAL_SECONDS` (20s)
 
 ## ✅ Ready to Deploy!
 
 1. Add `OPENAI_API_KEY` environment variable
 2. Push changes to GitHub (or manual deploy)
 3. Test with a real audio file
-4. Monitor Render logs for successful AI processing
+4. Monitor `journalctl -u snipnote-worker -f` for successful AI processing
 
 All done! 🎉
