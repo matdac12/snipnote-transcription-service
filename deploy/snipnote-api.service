@@ -8,6 +8,7 @@ Type=simple
 User=root
 WorkingDirectory=/opt/snipnote-transcription
 EnvironmentFile=/etc/snipnote-transcription/env
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/snipnote-transcription/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8100
 Restart=on-failure
 RestartSec=5

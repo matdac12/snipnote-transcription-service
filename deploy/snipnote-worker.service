@@ -8,6 +8,9 @@ Type=simple
 User=root
 WorkingDirectory=/opt/snipnote-transcription
 EnvironmentFile=/etc/snipnote-transcription/env
+# Without this, stdout is block-buffered into the journal and per-job progress
+# only appears minutes late (or not at all).
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/snipnote-transcription/.venv/bin/python worker.py --continuous
 Restart=always
 RestartSec=10
