@@ -10,6 +10,8 @@ The table is cached for CONFIG_TTL_SECONDS; if it can't be read, the last
 known config (or DEFAULT_CONFIG) is used so summaries never fail on config.
 """
 
+import io
+import os
 import time
 from typing import Any, Dict, Optional
 
@@ -27,12 +29,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "fallback_model": "gpt-6-luna",
 }
 
+# Transcription row defaults. TRANSCRIPTION_MODEL in the env file is only the
+# fallback for when the table is unreachable or has no 'transcription' row.
+TRANSCRIPTION_DEFAULT_CONFIG: Dict[str, Any] = {
+    "model": os.getenv("TRANSCRIPTION_MODEL", "gpt-transcribe"),
+    "fallback_model": None,
+}
+
 _cache: Dict[str, Dict[str, Any]] = {}
 _cache_loaded_at: float = 0.0
 
 
-def get_task_config(task: str) -> Dict[str, Any]:
-    """Return the config row for `task`, merged over DEFAULT_CONFIG."""
+def get_task_config(task: str, defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return the config row for `task`, merged over `defaults` (DEFAULT_CONFIG if None)."""
     global _cache, _cache_loaded_at
 
     if time.monotonic() - _cache_loaded_at > CONFIG_TTL_SECONDS:
@@ -47,7 +56,7 @@ def get_task_config(task: str) -> Dict[str, Any]:
         _cache_loaded_at = time.monotonic()
 
     row = _cache.get(task, {})
-    return {**DEFAULT_CONFIG, **{k: v for k, v in row.items() if v is not None or k == "fallback_model"}}
+    return {**(defaults or DEFAULT_CONFIG), **{k: v for k, v in row.items() if v is not None or k == "fallback_model"}}
 
 
 def create_response(
@@ -86,3 +95,30 @@ def create_response(
 
     print(f"   🤖 {task}: model={model} effort={config['reasoning_effort']}")
     return response
+
+
+def create_transcription(client: OpenAI, file: io.BytesIO, language: Optional[str] = None) -> str:
+    """
+    Transcribe `file` with the model configured for the 'transcription' task.
+
+    Only `model` and `fallback_model` apply. Retries once on `fallback_model`
+    if OpenAI rejects the request (400/404).
+    """
+    config = get_task_config("transcription", TRANSCRIPTION_DEFAULT_CONFIG)
+
+    def call(model: str) -> str:
+        file.seek(0)
+        kwargs: Dict[str, Any] = {"model": model, "file": file}
+        if language:
+            kwargs["language"] = language
+        return client.audio.transcriptions.create(**kwargs).text
+
+    model = config["model"]
+    try:
+        return call(model)
+    except (BadRequestError, NotFoundError) as e:
+        fallback = config["fallback_model"]
+        if not fallback or fallback == model:
+            raise
+        print(f"   ⚠️ transcription: model {model} rejected ({e}); retrying with {fallback}")
+        return call(fallback)

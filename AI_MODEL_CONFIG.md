@@ -1,16 +1,19 @@
 # AI Model Configuration (`ai_model_config`)
 
-Server-side summaries for meetings longer than 5 minutes (`generate_overview`,
-`generate_summary`, `extract_actions` in `jobs.py`) no longer hardcode a model.
-`ai_config.create_response()` reads the model, reasoning effort and verbosity for
-each task from the Supabase table `public.ai_model_config`.
+Server-side processing for meetings longer than 5 minutes no longer hardcodes models:
+- Transcription (`transcribe.py`) goes through `ai_config.create_transcription()`.
+- Summaries (`generate_overview`, `generate_summary`, `extract_actions` in `jobs.py`)
+  go through `ai_config.create_response()`.
+
+Both read the model (plus reasoning effort and verbosity for summaries) for each
+task from the Supabase table `public.ai_model_config`.
 
 The iOS app's `openai-proxy` Edge Function reads **the same rows**. Editing a row
 switches the model for both short (on-device) and long (VPS) meetings.
 
 | Column | Meaning |
 |---|---|
-| `task` | `overview`, `summary`, `actions` (used here); iOS also uses `title`, `text_summary`, `eve_chat`, `actions_report` |
+| `task` | `transcription`, `overview`, `summary`, `actions` (used here); iOS also uses `title`, `text_summary`, `eve_chat`, `actions_report` |
 | `model` | OpenAI model ID, e.g. `gpt-6-luna` |
 | `reasoning_effort` | e.g. `none`, `low`, `medium`, `high`. NULL uses the default `low`. Note: `minimal` is rejected by GPT-6 models. |
 | `verbosity` | `low`, `medium` or `high`. NULL uses the code default (`low` for overview and summary, unset for actions). |
@@ -22,8 +25,9 @@ switches the model for both short (on-device) and long (VPS) meetings.
 - If the table can't be read, the last known config is used. If nothing has been loaded yet,
   the defaults in `ai_config.DEFAULT_CONFIG` (`gpt-6-luna`, effort `low`) are used.
   Summaries never fail because of the config.
-- Transcription is **not** part of this table. It is still `TRANSCRIPTION_MODEL` in
-  `/etc/snipnote-transcription/env`.
+- The `transcription` row (seeded `gpt-transcribe`, fallback `gpt-4o-transcribe`) uses only
+  `model` and `fallback_model`. `TRANSCRIPTION_MODEL` in `/etc/snipnote-transcription/env`
+  is now only the default for when the table can't be read or has no `transcription` row.
 
 ---
 
@@ -63,7 +67,8 @@ systemctl status snipnote-api snipnote-worker --no-pager
 
 ### Verify
 1. Ask Mattia to process a meeting longer than 5 minutes from the app.
-2. `journalctl -u snipnote-worker -f` should show one line per AI step:
+2. `journalctl -u snipnote-worker -f` should show one line per AI step
+   (transcription has no log line of its own unless it falls back):
    ```
       🤖 summary: model=gpt-6-luna effort=low
       🤖 overview: model=gpt-6-luna effort=low
@@ -71,11 +76,13 @@ systemctl status snipnote-api snipnote-worker --no-pager
    ```
 3. A line like `⚠️ summary: model X rejected (...); retrying with gpt-6-luna` means the
    configured model or a parameter was refused. Look at the quoted OpenAI error and fix
-   the row in Supabase. No redeploy is needed.
+   the row in Supabase. No redeploy is needed. The same applies to
+   `⚠️ transcription: model X rejected (...); retrying with gpt-4o-transcribe`.
 4. `⚠️ Failed to load ai_model_config` means the worker can't read the table (missing
    table, or a network or key issue). It keeps running on the defaults. Rerun the check above.
 
 ### Roll back
 - **The model is the problem:** edit the row in Supabase. It applies within 60 seconds, no deploy.
 - **The code is the problem:** `git checkout <previous commit>` then restart both units.
-  The previous code hardcodes `gpt-5-mini` with `reasoning.effort: "minimal"`.
+  The previous code hardcodes `gpt-5-mini` with `reasoning.effort: "minimal"` for summaries,
+  and reads transcription from `TRANSCRIPTION_MODEL` again.

@@ -6,12 +6,14 @@ from functools import wraps
 from openai import OpenAI
 from pydub import AudioSegment
 
+from ai_config import create_transcription
+
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Transcription model. gpt-transcribe is 25% cheaper than gpt-4o-transcribe
-# ($0.0045/min vs $0.006/min) and more accurate on multi-speaker audio.
-# Override with TRANSCRIPTION_MODEL to roll back without a code change.
-TRANSCRIPTION_MODEL = os.getenv("TRANSCRIPTION_MODEL", "gpt-transcribe")
+# Transcription model comes from the 'transcription' row of the Supabase
+# ai_model_config table (see AI_MODEL_CONFIG.md). TRANSCRIPTION_MODEL in the env
+# file (default gpt-transcribe, 25% cheaper than gpt-4o-transcribe) is only used
+# when the table is unreachable or has no such row.
 
 
 def retry_with_backoff(max_retries: int = 3, base_delay: float = 1.0):
@@ -58,15 +60,7 @@ def transcribe_chunk_with_retry(chunk_bytes: bytes, chunk_name: str, language: O
     chunk_file = io.BytesIO(chunk_bytes)
     chunk_file.name = chunk_name
 
-    api_kwargs = {
-        "model": TRANSCRIPTION_MODEL,
-        "file": chunk_file
-    }
-    if language:
-        api_kwargs["language"] = language
-
-    response = client.audio.transcriptions.create(**api_kwargs)
-    return response.text
+    return create_transcription(client, chunk_file, language)
 
 # Constants matching iOS implementation
 MAX_CHUNK_SIZE_MB = 1.5
@@ -211,7 +205,7 @@ def transcribe_audio(
     language: Optional[str] = None
 ) -> dict:
     """
-    Transcribe audio using TRANSCRIPTION_MODEL with automatic chunking for large files
+    Transcribe audio using the configured transcription model with automatic chunking for large files
 
     Args:
         audio_data: Raw audio file bytes

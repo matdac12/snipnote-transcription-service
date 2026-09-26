@@ -99,17 +99,15 @@ curl -s https://api.snipnote.app/          # {"status":"healthy",...}
 
 ### Rolling back the transcription model
 
-`TRANSCRIPTION_MODEL` in `/etc/snipnote-transcription/env` selects the OpenAI model
-(default `gpt-transcribe`). To revert:
-
-```bash
-sed -i 's/^TRANSCRIPTION_MODEL=.*/TRANSCRIPTION_MODEL=gpt-4o-transcribe/' /etc/snipnote-transcription/env
-systemctl restart snipnote-worker snipnote-api
-```
+The transcription model is the `transcription` row of the Supabase `ai_model_config`
+table (seeded `gpt-transcribe`). To revert, set its `model` to `gpt-4o-transcribe` in the
+Table Editor. It applies within 60 seconds with no restart, and changes the iOS app's
+on-device path too. `TRANSCRIPTION_MODEL` in `/etc/snipnote-transcription/env` is only
+the default used when the table can't be read.
 
 ### Changing the AI summary model
 
-Overview, summary and action extraction use the model configured per task in the
+Transcription, overview, summary and action extraction use the model configured per task in the
 Supabase table `ai_model_config`. Edit the row in the Supabase Table Editor; it applies
 within 60 seconds, with no restart needed. See [`AI_MODEL_CONFIG.md`](AI_MODEL_CONFIG.md), which
 also has step-by-step instructions for deploying this change on the VPS.
