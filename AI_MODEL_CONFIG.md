@@ -15,7 +15,7 @@ switches the model for both short (on-device) and long (VPS) meetings.
 |---|---|
 | `task` | `transcription`, `overview`, `summary`, `actions` (used here); iOS also uses `title`, `text_summary`, `eve_chat`, `actions_report` |
 | `model` | OpenAI model ID, e.g. `gpt-6-luna` |
-| `reasoning_effort` | e.g. `none`, `low`, `medium`, `high`. NULL uses the default `low`. Note: `minimal` is rejected by GPT-6 models. |
+| `reasoning_effort` | e.g. `none`, `low`, `medium`, `high`. NULL sends no `reasoning` parameter (for models without reasoning). Note: `minimal` is rejected by GPT-6 models. |
 | `verbosity` | `low`, `medium` or `high`. NULL uses the code default (`low` for overview and summary, unset for actions). |
 | `fallback_model` | Retried once if OpenAI returns 400/404 for `model`. NULL disables the retry. |
 

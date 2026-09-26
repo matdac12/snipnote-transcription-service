@@ -41,7 +41,7 @@ TRANSCRIPTION_DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 _cache: Dict[str, Dict[str, Any]] = {}
-_cache_loaded_at: float = 0.0
+_cache_loaded_at: float = float("-inf")  # monotonic() can be < TTL right after boot
 _cache_lock = threading.Lock()
 
 T = TypeVar("T")
@@ -98,13 +98,16 @@ def create_response(
     Call the Responses API with the model/effort/verbosity configured for `task`.
 
     `default_verbosity` is used when the task's row leaves verbosity NULL.
+    A NULL reasoning_effort omits `reasoning` (for models without reasoning support).
     """
     config = get_task_config(task)
-    effort = config["reasoning_effort"] or DEFAULT_CONFIG["reasoning_effort"]
+    effort = config["reasoning_effort"]
     verbosity = config["verbosity"] or default_verbosity
 
     def call(model: str):
-        kwargs: Dict[str, Any] = {"model": model, "input": input, "reasoning": {"effort": effort}}
+        kwargs: Dict[str, Any] = {"model": model, "input": input}
+        if effort:
+            kwargs["reasoning"] = {"effort": effort}
         if verbosity:
             kwargs["text"] = {"verbosity": verbosity}
         print(f"   🤖 {task}: model={model} effort={effort}")
