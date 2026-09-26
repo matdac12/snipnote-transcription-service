@@ -107,6 +107,13 @@ sed -i 's/^TRANSCRIPTION_MODEL=.*/TRANSCRIPTION_MODEL=gpt-4o-transcribe/' /etc/s
 systemctl restart snipnote-worker snipnote-api
 ```
 
+### Changing the AI summary model
+
+Overview, summary and action extraction use the model configured per task in the
+Supabase table `ai_model_config`. Edit the row in the Supabase Table Editor; it applies
+within 60 seconds, with no restart needed. See [`AI_MODEL_CONFIG.md`](AI_MODEL_CONFIG.md), which
+also has step-by-step instructions for deploying this change on the VPS.
+
 ### Memory notes
 
 This box has 2 vCPU / 3.7 GB shared with the Omni assistant, Postgres and two Next.js

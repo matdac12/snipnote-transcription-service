@@ -19,6 +19,7 @@ from supabase_client import (
     increment_retry_count
 )
 from transcribe import transcribe_audio
+from ai_config import create_response
 
 
 # Maximum retry attempts before permanent failure
@@ -202,7 +203,7 @@ def download_audio(audio_url: str) -> bytes:
 
 @retry_with_backoff(max_retries=3, base_delay=1.0)
 def generate_overview(summary: str) -> str:
-    """Generate 1-sentence meeting overview using GPT-5-mini from summary"""
+    """Generate 1-sentence meeting overview from summary (model from ai_model_config)"""
     print(f"   📝 Generating overview from summary...")
 
     prompt = f"""Identify the language spoken and always respond in the same language as the input.
@@ -215,14 +216,14 @@ Examples:
 
 Meeting Summary: {summary}"""
 
-    response = openai_client.responses.create(
-        model="gpt-5-mini",
+    response = create_response(
+        openai_client,
+        "overview",
         input=[
             {"role": "system", "content": "You create concise one-sentence meeting overviews. Always respond with exactly one clear, informative sentence in the same language as the input transcript."},
             {"role": "user", "content": prompt}
         ],
-        reasoning={"effort": "minimal"},
-        text={"verbosity": "low"}
+        default_verbosity="low"
     )
 
     # Find the message output (reasoning output doesn't have content)
@@ -237,7 +238,7 @@ Meeting Summary: {summary}"""
 
 @retry_with_backoff(max_retries=3, base_delay=1.0)
 def generate_summary(transcript: str) -> str:
-    """Generate comprehensive meeting summary using GPT-5-mini"""
+    """Generate comprehensive meeting summary (model from ai_model_config)"""
     print(f"   📄 Generating summary...")
 
     prompt = f"""Identify the language spoken and always respond in the same language as the input transcript.
@@ -261,14 +262,14 @@ Please create a comprehensive meeting summary from this transcript. Structure yo
 
 Meeting Transcript: {transcript}"""
 
-    response = openai_client.responses.create(
-        model="gpt-5-mini",
+    response = create_response(
+        openai_client,
+        "summary",
         input=[
             {"role": "system", "content": "You are a professional meeting summarizer. Create structured, comprehensive summaries that capture key decisions, action items, and next steps. Always respond in the same language as the input transcript."},
             {"role": "user", "content": prompt}
         ],
-        reasoning={"effort": "minimal"},
-        text={"verbosity": "low"}
+        default_verbosity="low"
     )
 
     # Find the message output (reasoning output doesn't have content)
@@ -283,7 +284,7 @@ Meeting Transcript: {transcript}"""
 
 @retry_with_backoff(max_retries=3, base_delay=1.0)
 def extract_actions(summary: str) -> list:
-    """Extract action items from summary using GPT-5-mini"""
+    """Extract action items from summary (model from ai_model_config)"""
     print(f"   ✅ Extracting actions from summary...")
 
     prompt = f"""Identify the language spoken and always respond in the same language as the input.
@@ -298,13 +299,13 @@ If no actionable items exist, return an empty array: []
 
 Meeting Summary: {summary}"""
 
-    response = openai_client.responses.create(
-        model="gpt-5-mini",
+    response = create_response(
+        openai_client,
+        "actions",
         input=[
             {"role": "system", "content": "You extract actionable items from text and return them as JSON. Be precise and only return valid JSON. Always use the same language as the input transcript for action descriptions."},
             {"role": "user", "content": prompt}
-        ],
-        reasoning={"effort": "minimal"}
+        ]
     )
 
     try:
