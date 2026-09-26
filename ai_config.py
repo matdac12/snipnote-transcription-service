@@ -6,14 +6,16 @@ reasoning_effort, verbosity, fallback_model) and are edited from the Supabase
 Table Editor. The same rows drive the `openai-proxy` Edge Function used by the
 iOS app, so one edit switches both on-device and server-side meetings.
 
-The table is cached for CONFIG_TTL_SECONDS; if it can't be read, the last
-known config (or DEFAULT_CONFIG) is used so summaries never fail on config.
+The table is the source of truth. It is cached for CONFIG_TTL_SECONDS; if it
+can't be read, the last known config (or the defaults below) is used so jobs
+never fail on config.
 """
 
 import io
 import os
+import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, TypeVar
 
 from openai import BadRequestError, NotFoundError, OpenAI
 
@@ -21,42 +23,69 @@ from supabase_client import supabase
 
 CONFIG_TTL_SECONDS = 60
 
-# Used when the table is unreachable or has no row for a task
+CONFIG_FIELDS = ("model", "reasoning_effort", "verbosity", "fallback_model")
+
+# Fallbacks for when the table is unreachable or has no row for a task.
+# Keep in sync with the seed rows in the SnipNote migration.
 DEFAULT_CONFIG: Dict[str, Any] = {
     "model": "gpt-6-luna",
     "reasoning_effort": "low",
     "verbosity": None,
-    "fallback_model": "gpt-6-luna",
+    "fallback_model": None,
 }
-
-# Transcription row defaults. TRANSCRIPTION_MODEL in the env file is only the
-# fallback for when the table is unreachable or has no 'transcription' row.
 TRANSCRIPTION_DEFAULT_CONFIG: Dict[str, Any] = {
     "model": os.getenv("TRANSCRIPTION_MODEL", "gpt-transcribe"),
-    "fallback_model": None,
+    "reasoning_effort": None,
+    "verbosity": None,
+    "fallback_model": "gpt-4o-transcribe",
 }
 
 _cache: Dict[str, Dict[str, Any]] = {}
 _cache_loaded_at: float = 0.0
+_cache_lock = threading.Lock()
+
+T = TypeVar("T")
 
 
-def get_task_config(task: str, defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Return the config row for `task`, merged over `defaults` (DEFAULT_CONFIG if None)."""
+def _refresh_cache_if_stale() -> None:
     global _cache, _cache_loaded_at
 
-    if time.monotonic() - _cache_loaded_at > CONFIG_TTL_SECONDS:
+    # Transcription runs in several threads; only one of them refreshes
+    with _cache_lock:
+        if time.monotonic() - _cache_loaded_at <= CONFIG_TTL_SECONDS:
+            return
         try:
-            result = supabase.table("ai_model_config").select(
-                "task, model, reasoning_effort, verbosity, fallback_model"
-            ).execute()
+            result = supabase.table("ai_model_config").select("task, " + ", ".join(CONFIG_FIELDS)).execute()
             _cache = {row["task"]: row for row in result.data or []}
         except Exception as e:
             print(f"⚠️ Failed to load ai_model_config, using cached/default config: {e}")
         # Also throttles retries while the table is unreachable
         _cache_loaded_at = time.monotonic()
 
-    row = _cache.get(task, {})
-    return {**(defaults or DEFAULT_CONFIG), **{k: v for k, v in row.items() if v is not None or k == "fallback_model"}}
+
+def get_task_config(task: str, defaults: Dict[str, Any] = DEFAULT_CONFIG) -> Dict[str, Any]:
+    """
+    Return the config for `task`. A row replaces `defaults` entirely; NULL columns
+    mean "not set" (a NULL fallback_model disables the fallback retry).
+    """
+    _refresh_cache_if_stale()
+    row = _cache.get(task)
+    if row is None:
+        return dict(defaults)
+    return {field: row.get(field) for field in CONFIG_FIELDS}
+
+
+def _call_with_fallback(task: str, config: Dict[str, Any], call: Callable[[str], T]) -> T:
+    """Run `call(model)`; if OpenAI rejects it (400/404), retry once on `fallback_model`."""
+    model = config["model"]
+    try:
+        return call(model)
+    except (BadRequestError, NotFoundError) as e:
+        fallback = config["fallback_model"]
+        if not fallback or fallback == model:
+            raise
+        print(f"   ⚠️ {task}: model {model} rejected ({e}); retrying with {fallback}")
+        return call(fallback)
 
 
 def create_response(
@@ -69,41 +98,23 @@ def create_response(
     Call the Responses API with the model/effort/verbosity configured for `task`.
 
     `default_verbosity` is used when the task's row leaves verbosity NULL.
-    Retries once on `fallback_model` if OpenAI rejects the request (400/404).
     """
     config = get_task_config(task)
+    effort = config["reasoning_effort"] or DEFAULT_CONFIG["reasoning_effort"]
+    verbosity = config["verbosity"] or default_verbosity
 
     def call(model: str):
-        kwargs: Dict[str, Any] = {"model": model, "input": input}
-        if config["reasoning_effort"]:
-            kwargs["reasoning"] = {"effort": config["reasoning_effort"]}
-        verbosity = config["verbosity"] or default_verbosity
+        kwargs: Dict[str, Any] = {"model": model, "input": input, "reasoning": {"effort": effort}}
         if verbosity:
             kwargs["text"] = {"verbosity": verbosity}
+        print(f"   🤖 {task}: model={model} effort={effort}")
         return client.responses.create(**kwargs)
 
-    model = config["model"]
-    try:
-        response = call(model)
-    except (BadRequestError, NotFoundError) as e:
-        fallback = config["fallback_model"]
-        if not fallback or fallback == model:
-            raise
-        print(f"   ⚠️ {task}: model {model} rejected ({e}); retrying with {fallback}")
-        model = fallback
-        response = call(model)
-
-    print(f"   🤖 {task}: model={model} effort={config['reasoning_effort']}")
-    return response
+    return _call_with_fallback(task, config, call)
 
 
 def create_transcription(client: OpenAI, file: io.BytesIO, language: Optional[str] = None) -> str:
-    """
-    Transcribe `file` with the model configured for the 'transcription' task.
-
-    Only `model` and `fallback_model` apply. Retries once on `fallback_model`
-    if OpenAI rejects the request (400/404).
-    """
+    """Transcribe `file` with the model configured for the 'transcription' task."""
     config = get_task_config("transcription", TRANSCRIPTION_DEFAULT_CONFIG)
 
     def call(model: str) -> str:
@@ -113,12 +124,4 @@ def create_transcription(client: OpenAI, file: io.BytesIO, language: Optional[st
             kwargs["language"] = language
         return client.audio.transcriptions.create(**kwargs).text
 
-    model = config["model"]
-    try:
-        return call(model)
-    except (BadRequestError, NotFoundError) as e:
-        fallback = config["fallback_model"]
-        if not fallback or fallback == model:
-            raise
-        print(f"   ⚠️ transcription: model {model} rejected ({e}); retrying with {fallback}")
-        return call(fallback)
+    return _call_with_fallback("transcription", config, call)
