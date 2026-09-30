@@ -297,6 +297,47 @@ def get_audio_chunks(meeting_id: str, user_id: str) -> list[Dict[str, Any]]:
         raise
 
 
+# --- Ownership / quota lookups used by POST /jobs (service key; RLS does not apply) ----------
+
+ACTIVE_JOB_STATUSES = ["awaiting_upload", "pending", "processing"]
+
+
+def get_recording_row(user_id: str, meeting_id: str) -> Optional[Dict[str, Any]]:
+    """The `recordings` row the app inserts right after uploading a meeting's audio
+    (columns: user_id, meeting_id, file_path, duration seconds, file_size), or None."""
+    response = (
+        supabase.table("recordings").select("file_path, duration, file_size")
+        .eq("user_id", user_id).eq("meeting_id", meeting_id).limit(1).execute()
+    )
+    return (response.data or [None])[0]
+
+
+def get_chunk_rows(user_id: str, meeting_id: str) -> list[Dict[str, Any]]:
+    """Uploaded `audio_chunks` rows of a meeting (owner-filtered)."""
+    response = (
+        supabase.table("audio_chunks").select("chunk_index, duration_seconds, file_size")
+        .eq("user_id", user_id).eq("meeting_id", meeting_id).order("chunk_index").execute()
+    )
+    return response.data or []
+
+
+def list_active_jobs(user_id: str, limit: int = 200) -> list[Dict[str, Any]]:
+    """The user's jobs that are still queued or running (awaiting_upload, pending, processing)."""
+    def query(statuses):
+        return (
+            supabase.table("transcription_jobs")
+            .select("id, meeting_id, status, is_chunked, duration, created_at")
+            .eq("user_id", user_id).in_("status", statuses)
+            .order("created_at", desc=True).limit(limit).execute()
+        ).data or []
+    try:
+        return query(ACTIVE_JOB_STATUSES)
+    except Exception:
+        # Migration 006 (enum value awaiting_upload) not applied yet: PostgREST rejects the
+        # unknown enum literal. Fall back to the statuses every schema has.
+        return query(["pending", "processing"])
+
+
 def update_chunk_transcript(chunk_id: str, transcript: str) -> Dict[str, Any]:
     """
     Update a chunk with its transcript and mark as transcribed

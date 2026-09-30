@@ -274,6 +274,29 @@ location = /transcribe { return 410; }
 
 then `nginx -t && systemctl reload nginx`.
 
+**API authentication (`AUTH_MODE=off|log|enforce`, default `log`).** One token mechanism
+(`auth.py`): local verification when `SUPABASE_JWT_SECRET`/JWKS is set, otherwise
+`GET {SUPABASE_URL}/auth/v1/user` (cached 60 s, junk/expired tokens never reach Supabase). Nothing
+has to be configured for the default remote mode; `SUPABASE_ANON_KEY` is optional (the service key
+is used as `apikey` otherwise). Behaviour:
+
+| | `GET /jobs/{id}` | legacy `POST /jobs` |
+|---|---|---|
+| `off` | as before, but `audio_url` withheld | as before (+ always-on checks below) |
+| `log` (default) | no token: served, `audio_url` null, counted; token of another user: 404 | no token: served, `user_id` from body; token present: its user is used, body mismatch 403; missing `recordings`/`audio_chunks` rows are only logged (`would reject`) |
+| `enforce` | 401 without a valid token, 404 unless owner | 401 without token, 404 when no matching `recordings`/`audio_chunks` row |
+
+Always on in every mode (old builds already satisfy them): UUID-shaped `user_id`/`meeting_id`, a
+validated `audio_url` (see next paragraph), `total_chunks` <= `MAX_CHUNKS_PER_JOB`, duration <=
+`MAX_JOB_DURATION_SECONDS` (12 h), a queued/running job of the same meeting is returned instead of
+creating a duplicate, at most `MAX_ACTIVE_JOBS_PER_USER` (20) concurrent jobs per user (429). Tables that
+cannot be queried never block a request. `upload_pending` creation always requires a token.
+`GET` answers never include `audio_url` for non-owners; `user_id` is always present (the iOS decoder
+requires it). Rollout: deploy in `log`, watch the `[auth] ... missing` lines shrink after the iOS
+release (see "iOS follow-ups" in docs/SECURITY_AND_MINUTES_ROLLOUT.md), then set `AUTH_MODE=enforce`
+and restart `snipnote-api`. Enforcing early makes old builds' polls fail (they surface as polling
+errors and trigger the on-device fallback, so pair it with a force-update).
+
 **Worker download hardening (code).** Legacy `audio_url` jobs used to be fetched with
 `follow_redirects=True`, no host check and no size cap (SSRF against the box, OOM). Now
 (`audio_access.py`): the URL must be `https://<SUPABASE_URL host>/storage/v1/object/(public|sign|authenticated)/recordings/<job.user_id>/...`

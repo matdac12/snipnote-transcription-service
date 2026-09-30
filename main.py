@@ -10,6 +10,7 @@ import warnings
 from supabase_client import create_job, get_job
 import auth
 import background_upload
+import job_policy
 import audio_access
 
 # Suppress pydub regex warnings in Python 3.13+
@@ -61,9 +62,9 @@ class CreateJobRequest(BaseModel):
     content_type: str | None = None    # default derived from the extension
 
     @model_validator(mode="after")
-    def _legacy_requires_user_id(self):
-        if not self.upload_pending and not self.user_id:
-            raise ValueError("user_id is required")
+    def _legacy_needs_identity(self):
+        # Legacy mode takes user_id from the body. A valid bearer token may replace it, so
+        # "missing user_id" is decided in the handler once the token has been looked at.
         return self
 
 
@@ -154,26 +155,7 @@ async def create_transcription_job(
     """
     if request.upload_pending:
         return await create_upload_pending_job(request, authorization)
-    try:
-        # Create job in Supabase
-        job = create_job(
-            user_id=request.user_id,
-            meeting_id=request.meeting_id,
-            audio_url=request.audio_url,
-            is_chunked=request.is_chunked,
-            total_chunks=request.total_chunks,
-            duration=request.duration,
-            language=request.language,
-            transcription_provider=request.transcription_provider
-        )
-
-        return CreateJobResponse(
-            job_id=job["id"],
-            status=job["status"],
-            created_at=job["created_at"]
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create job: {str(e)}")
+    return await create_legacy_job(request, authorization)
 
 
 async def identify_caller(authorization: str | None, endpoint: str):
@@ -194,6 +176,52 @@ async def identify_caller(authorization: str | None, endpoint: str):
         raise HTTPException(status_code=401, detail="Missing or invalid bearer token",
                             headers={"WWW-Authenticate": "Bearer"})
     return None
+
+
+async def create_legacy_job(request: CreateJobRequest, authorization: str | None) -> CreateJobResponse:
+    """Legacy POST /jobs (audio already uploaded by the app). Which checks are always on and
+    which depend on AUTH_MODE is documented in job_policy.py."""
+    mode = auth.auth_mode()
+    user = await identify_caller(authorization, "POST /jobs")
+    if user and request.user_id and request.user_id.lower() != user.user_id:
+        raise HTTPException(status_code=403, detail="user_id does not match the authenticated user")
+    user_id = user.user_id if user else (request.user_id or "").lower()
+    if not user_id:
+        raise HTTPException(status_code=422, detail="user_id is required")
+
+    storage_path = job_policy.validate_shape(
+        user_id, request.meeting_id, request.is_chunked, request.total_chunks, request.duration, request.audio_url)
+    meeting_id = request.meeting_id.lower()
+
+    def blocking_part():
+        existing = job_policy.find_or_cap_active(user_id, meeting_id)
+        if existing:
+            return existing, None
+        info = job_policy.check_ownership(mode, user_id, meeting_id, request.is_chunked, request.total_chunks, storage_path)
+        job = create_job(
+            user_id=user_id,
+            meeting_id=meeting_id,
+            audio_url=request.audio_url,
+            is_chunked=request.is_chunked,
+            total_chunks=request.total_chunks,
+            duration=request.duration,
+            language=request.language,
+            transcription_provider=request.transcription_provider
+        )
+        return None, job
+
+    try:
+        existing, job = await run_in_threadpool(blocking_part)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Generic body: the error text can contain database internals.
+        print(f"❌ Failed to create job: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create job")
+    if existing:
+        print(f"♻️ Job {existing['id']} for this meeting is already {existing['status']}; returning it")
+        return CreateJobResponse(job_id=existing["id"], status=existing["status"], created_at=existing["created_at"])
+    return CreateJobResponse(job_id=job["id"], status=job["status"], created_at=job["created_at"])
 
 
 async def create_upload_pending_job(request: CreateJobRequest, authorization: str | None):
