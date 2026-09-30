@@ -1,4 +1,3 @@
-import httpx
 import io
 import json
 import os
@@ -18,7 +17,9 @@ from supabase_client import (
     update_chunks_processed,
     increment_retry_count,
     download_storage_object_to_file,
+    download_storage_object_bytes,
 )
+import audio_access
 from transcribe import transcribe_audio
 from ai_config import create_response
 import xai_single
@@ -131,8 +132,6 @@ def is_retryable_error(error: Exception) -> bool:
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-# Reusable HTTP client for connection pooling
-http_client = httpx.Client(timeout=120.0)
 
 
 def retry_with_backoff(max_retries: int = 3, base_delay: float = 1.0):
@@ -184,36 +183,34 @@ def get_pending_jobs() -> List[Dict[str, Any]]:
         return []
 
 
-def download_audio(audio_url: str) -> bytes:
+def download_audio(audio_url: str, user_id: str) -> bytes:
     """
-    Download audio file from URL using reusable HTTP client for connection pooling
+    Download a legacy job's audio into memory, size-capped.
+
+    SSRF / cross-user hardening (audit A2): `audio_url` is attacker-controllable, so it is
+    never requested. It is validated (Supabase host, `.../recordings/<user_id>/...`) and the
+    object is fetched BY PATH through the service-key storage API without following redirects,
+    aborting above MAX_DOWNLOAD_BYTES (300 MiB). Legit app-generated URLs are unchanged.
 
     Args:
-        audio_url: URL to audio file (Supabase Storage or public URL)
-
-    Returns:
-        Audio file bytes
+        audio_url: public/signed/authenticated Supabase Storage URL saved by the app
+        user_id: owner of the job; the object path must start with it
 
     Raises:
-        Exception: If download fails
+        audio_access.AudioAccessError (permanent), StorageError / DownloadTooLarge
     """
-    print(f"   📥 Downloading audio from {audio_url[:50]}...")
-
-    response = http_client.get(audio_url, follow_redirects=True)
-    response.raise_for_status()
-
-    print(f"   ✅ Downloaded {len(response.content)} bytes")
-    return response.content
+    path = audio_access.storage_path_from_url(audio_url, user_id)
+    print(f"   📥 Downloading audio object {path[:60]}...")
+    data = download_storage_object_bytes(path)
+    print(f"   ✅ Downloaded {len(data)} bytes")
+    return data
 
 
-def download_audio_to_file(audio_url: str, dest_path: str) -> None:
-    """Stream an audio URL to disk (constant memory; used by the xAI single-request path)."""
-    print(f"   📥 Streaming audio to disk from {audio_url[:50]}...")
-    with http_client.stream("GET", audio_url, follow_redirects=True) as response:
-        response.raise_for_status()
-        with open(dest_path, "wb") as out:
-            for block in response.iter_bytes(1024 * 1024):
-                out.write(block)
+def download_audio_to_file(audio_url: str, dest_path: str, user_id: str) -> None:
+    """Stream a legacy job's audio to disk (constant memory; xAI single-request path). Same guards as download_audio."""
+    path = audio_access.storage_path_from_url(audio_url, user_id)
+    print(f"   📥 Streaming audio object {path[:60]} to disk...")
+    download_storage_object_to_file(path, dest_path)
 
 
 @retry_with_backoff(max_retries=3, base_delay=1.0)
@@ -365,7 +362,10 @@ Meeting Summary: {summary}"""
 
 def download_chunk_from_storage(chunk_file_path: str) -> bytes:
     """
-    Download a single chunk from Supabase Storage
+    Download a single chunk from Supabase Storage (service key, size-capped, no redirects)
+
+    `chunk_file_path` must already have been validated against the job's user id
+    (process_chunked_job does that for every chunk before any download starts).
 
     Args:
         chunk_file_path: File path in storage (e.g., "userId/meetingId_chunk_0.m4a")
@@ -374,16 +374,13 @@ def download_chunk_from_storage(chunk_file_path: str) -> bytes:
         Audio chunk bytes
 
     Raises:
-        Exception: If download fails
+        Exception: If download fails or the chunk exceeds MAX_DOWNLOAD_BYTES
     """
     try:
         print(f"   📥 Downloading chunk: {chunk_file_path}")
-
-        # Download from Supabase Storage using service key
-        response = supabase.storage.from_("recordings").download(chunk_file_path)
-
-        print(f"   ✅ Downloaded chunk: {len(response)} bytes")
-        return response
+        data = download_storage_object_bytes(chunk_file_path)
+        print(f"   ✅ Downloaded chunk: {len(data)} bytes")
+        return data
 
     except Exception as e:
         print(f"   ❌ Failed to download chunk {chunk_file_path}: {e}")
@@ -525,10 +522,17 @@ def process_chunked_job(job: Dict[str, Any]):
         # Step 2: Fetch all audio chunks from database
         print(f"   📋 Fetching audio chunks from database...")
         update_job_progress(job_id, 5, "Fetching audio chunks...")
-        chunks = get_audio_chunks(meeting_id)
+        chunks = get_audio_chunks(meeting_id, job.get("user_id"))
 
         if not chunks:
             raise Exception(f"No audio chunks found for meeting {meeting_id}")
+
+        # audio_chunks rows are client-writable: only ever read objects inside the job
+        # owner's folder, and bound the amount of work one job can create (audit A2).
+        if len(chunks) > audio_access.max_chunks_per_job():
+            raise audio_access.AudioAccessError(f"too many chunks ({len(chunks)})")
+        for chunk in chunks:
+            chunk["file_path"] = audio_access.validate_storage_path(chunk.get("file_path"), job.get("user_id"))
 
         if len(chunks) != total_chunks:
             print(f"   ⚠️ Expected {total_chunks} chunks, found {len(chunks)}")
@@ -630,13 +634,13 @@ def process_chunked_job(job: Dict[str, Any]):
             print(f"   ⚠️  Failed to update job status: {update_error}")
 
 
-def transcribe_regular_job_audio(job_id: str, audio_url: str, language, provider: str):
+def transcribe_regular_job_audio(job_id: str, audio_url: str, language, provider: str, user_id: str = None):
     """Existing regular path: download into memory, transcribe (chunked internally), return (text, duration)."""
     # Step 2: Download audio (0-10%)
     print(f"   📥 Downloading audio...")
     update_job_progress(job_id, 5, "Downloading audio...")
     notify_stage(job_id, "preparing", 5)
-    audio_data = download_audio(audio_url)
+    audio_data = download_audio(audio_url, user_id)
     update_job_progress(job_id, 10, "Audio downloaded")
 
     # Step 3: Transcribe using OpenAI Whisper (10-60%)
@@ -751,7 +755,7 @@ def process_job(job: Dict[str, Any]):
         if xai_single.should_use_single_request(provider):
             single = xai_single.run_single_request(
                 [(lambda dest: download_storage_object_to_file(storage_path, dest)) if storage_path
-                 else (lambda dest: download_audio_to_file(audio_url, dest))],
+                 else (lambda dest: download_audio_to_file(audio_url, dest, job.get("user_id")))],
                 language,
                 progress=lambda pct, stage: (
                     update_job_progress(job_id, 5 + int(pct * 0.55), stage),
@@ -764,7 +768,7 @@ def process_job(job: Dict[str, Any]):
         elif storage_path:
             transcript, duration = transcribe_uploaded_job_audio(job_id, job, language, provider)
         else:
-            transcript, duration = transcribe_regular_job_audio(job_id, audio_url, language, provider)
+            transcript, duration = transcribe_regular_job_audio(job_id, audio_url, language, provider, job.get("user_id"))
 
         print(f"   ✅ Transcription complete: {len(transcript)} chars, {duration:.1f}s")
 

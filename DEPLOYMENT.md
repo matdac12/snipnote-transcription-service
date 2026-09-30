@@ -272,7 +272,21 @@ can burn provider credit and block the API process. Block it in nginx before shi
 location = /transcribe { return 410; }
 ```
 
-then `nginx -t && systemctl reload nginx`. The full `deploy/nginx-snipnote-api.conf` in this
+then `nginx -t && systemctl reload nginx`.
+
+**Worker download hardening (code).** Legacy `audio_url` jobs used to be fetched with
+`follow_redirects=True`, no host check and no size cap (SSRF against the box, OOM). Now
+(`audio_access.py`): the URL must be `https://<SUPABASE_URL host>/storage/v1/object/(public|sign|authenticated)/recordings/<job.user_id>/...`
+(extra hosts via `AUDIO_URL_ALLOWED_HOSTS`), and the object is downloaded **by path** through
+the service-key storage API (works unchanged once the `recordings` bucket is made private),
+without redirects, streamed and aborted above `MAX_DOWNLOAD_BYTES` (300 MiB). Chunked jobs:
+`get_audio_chunks(meeting_id, user_id)` filters by the job owner, and every chunk path must be
+inside `<user_id>/` (audio_chunks rows are client-writable) with at most `MAX_CHUNKS_PER_JOB`
+rows. Violations fail the job permanently (`invalid audio location: ...`, no retry loop).
+Legit app-generated URLs (`.../object/public/recordings/<lowercase uid>/<meeting>.m4a`) are unchanged.
+Verify after deploy: `journalctl -u snipnote-worker | grep "invalid audio location"` stays empty
+for normal traffic. If `SUPABASE_URL` on the VPS differs from the host the app uses, legit jobs
+would fail: check that first. The full `deploy/nginx-snipnote-api.conf` in this
 repo contains that block plus `limit_req` on `POST /jobs` (60/min per IP, burst 20, 429) and a
 64k `client_max_body_size` (the API only takes small JSON). The new Python code also answers 410
 on its own, so the nginx block stays as defence in depth. CORS is now off by default

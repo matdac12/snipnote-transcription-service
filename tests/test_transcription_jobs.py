@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from fastapi.testclient import TestClient
 import support
+from support import TEST_USER_ID, TEST_MEETING_ID, TEST_AUDIO_URL, chunk_path_for
 import main
 import jobs
 import supabase_client
@@ -13,7 +14,7 @@ import supabase_client
 class JobTests(unittest.TestCase):
     def setUp(self):
         self.api = TestClient(main.app)
-        self.payload = {'user_id': 'user', 'meeting_id': 'meeting', 'audio_url': 'https://offline.invalid/audio'}
+        self.payload = {'user_id': TEST_USER_ID, 'meeting_id': TEST_MEETING_ID, 'audio_url': TEST_AUDIO_URL}
         self.inserted = []
         self.table_patch = patch.object(supabase_client.supabase, 'table')
         table = self.table_patch.start().return_value
@@ -51,7 +52,7 @@ class JobTests(unittest.TestCase):
 
     def test_invalid_provider_rejected_before_database(self):
         with self.assertRaises(ValueError):
-            supabase_client.create_job('user', 'meeting', transcription_provider='unknown')
+            supabase_client.create_job(TEST_USER_ID, TEST_MEETING_ID, transcription_provider='unknown')
         self.assertEqual(self.inserted, [])
 
     def run_worker(self, chunked=False, provider='xai'):
@@ -61,7 +62,7 @@ class JobTests(unittest.TestCase):
         with ExitStack() as stack:
             mocks = {}
             for name, result in {'download_audio': b'audio', 'download_chunk_from_storage': b'audio', 'get_audio_chunks': [
-                {'id': 'chunk1', 'chunk_index': 0, 'file_path': 'one'}, {'id': 'chunk2', 'chunk_index': 1, 'file_path': 'two'}],
+                {'id': 'chunk1', 'chunk_index': 0, 'file_path': chunk_path_for(0)}, {'id': 'chunk2', 'chunk_index': 1, 'file_path': chunk_path_for(1)}],
                 'update_job_status': None, 'update_job_progress': None, 'update_chunk_transcript': None,
                 'update_chunks_processed': None, 'increment_retry_count': None, 'update_job_with_results': None,
                 'transcribe_audio': {'transcript': 'transcript', 'duration': 30},

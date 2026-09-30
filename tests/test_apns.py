@@ -15,6 +15,7 @@ import jwt
 import support  # noqa: F401  (offline env before any project import)
 import apns
 import jobs
+from support import TEST_USER_ID, TEST_AUDIO_URL, chunk_path_for
 
 TOKEN = 'ab' * 32
 PEM = ec.generate_private_key(ec.SECP256R1()).private_bytes(
@@ -362,7 +363,7 @@ class JobWiringTests(unittest.TestCase):
     def run_job(self, job, fail=None):
         results = {
             'download_audio': b'audio', 'download_chunk_from_storage': b'audio',
-            'get_audio_chunks': [{'id': 'c1', 'chunk_index': 0, 'file_path': 'one'}, {'id': 'c2', 'chunk_index': 1, 'file_path': 'two'}],
+            'get_audio_chunks': [{'id': 'c1', 'chunk_index': 0, 'file_path': chunk_path_for(0)}, {'id': 'c2', 'chunk_index': 1, 'file_path': chunk_path_for(1)}],
             'update_job_status': None, 'update_job_progress': None, 'update_chunk_transcript': None,
             'update_chunks_processed': None, 'increment_retry_count': None, 'update_job_with_results': None,
             'transcribe_audio': {'transcript': 't', 'duration': 30},
@@ -376,25 +377,25 @@ class JobWiringTests(unittest.TestCase):
         return [c.args[1] for c in notify.call_args_list], notify
 
     def test_regular_job_stage_sequence(self):
-        stages, _ = self.run_job({'id': 'j', 'audio_url': 'http://x', 'transcription_provider': 'openai'})
+        stages, _ = self.run_job({'id': 'j', 'user_id': TEST_USER_ID, 'audio_url': TEST_AUDIO_URL, 'transcription_provider': 'openai'})
         self.assertEqual(stages[0], 'preparing')
         self.assertIn('transcribing', stages)
         self.assertEqual([s for s in stages if s in ('summarizing', 'done')], ['summarizing', 'done'])
         self.assertEqual(stages[-1], 'done')
 
     def test_chunked_job_reports_chunk_counts(self):
-        stages, notify = self.run_job({'id': 'j', 'meeting_id': 'm', 'is_chunked': True, 'total_chunks': 2, 'transcription_provider': 'openai'})
+        stages, notify = self.run_job({'id': 'j', 'user_id': TEST_USER_ID, 'meeting_id': 'm', 'is_chunked': True, 'total_chunks': 2, 'transcription_provider': 'openai'})
         self.assertEqual((stages[0], stages[-1]), ('preparing', 'done'))
         chunk_calls = [c.kwargs for c in notify.call_args_list if c.args[1] == 'transcribing' and c.kwargs.get('chunk')]
         self.assertEqual([c['chunk'] for c in chunk_calls], [1, 2])
         self.assertEqual({c['total_chunks'] for c in chunk_calls}, {2})
 
     def test_permanent_failure_sends_failed(self):
-        stages, _ = self.run_job({'id': 'j', 'audio_url': 'http://x'}, fail=Exception('invalid audio'))
+        stages, _ = self.run_job({'id': 'j', 'user_id': TEST_USER_ID, 'audio_url': TEST_AUDIO_URL}, fail=Exception('invalid audio'))
         self.assertEqual(stages[-1], 'failed')
 
     def test_retryable_failure_goes_back_to_queued_not_failed(self):
-        stages, _ = self.run_job({'id': 'j', 'audio_url': 'http://x'}, fail=Exception('connection reset'))
+        stages, _ = self.run_job({'id': 'j', 'user_id': TEST_USER_ID, 'audio_url': TEST_AUDIO_URL}, fail=Exception('connection reset'))
         self.assertEqual(stages[-1], 'queued')
         self.assertNotIn('failed', stages)
 

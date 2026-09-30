@@ -255,12 +255,17 @@ def update_job_with_results(
         raise
 
 
-def get_audio_chunks(meeting_id: str) -> list[Dict[str, Any]]:
+def get_audio_chunks(meeting_id: str, user_id: str) -> list[Dict[str, Any]]:
     """
-    Fetch all audio chunks for a meeting, ordered by chunk_index
+    Fetch the audio chunks of one user's meeting, ordered by chunk_index
+
+    `user_id` is REQUIRED and always filtered on: the worker uses the service key, and
+    meeting ids alone must never be enough to read someone else's chunks (audit A2).
+    Callers pass the job's user_id.
 
     Args:
         meeting_id: UUID of the meeting
+        user_id: UUID of the job's owner
 
     Returns:
         List of audio chunk dictionaries, ordered by chunk_index
@@ -268,11 +273,14 @@ def get_audio_chunks(meeting_id: str) -> list[Dict[str, Any]]:
     Raises:
         Exception: If query fails
     """
+    if not user_id:
+        raise ValueError("user_id is required to fetch audio chunks")
     try:
         response = (
             supabase.table("audio_chunks")
             .select("*")
             .eq("meeting_id", meeting_id)
+            .eq("user_id", user_id)
             .order("chunk_index")
             .execute()
         )
@@ -411,6 +419,8 @@ import urllib.parse as _urlparse
 
 import httpx
 
+import audio_access
+
 RECORDINGS_BUCKET = os.getenv("RECORDINGS_BUCKET", "recordings")
 STORAGE_BASE_URL = f"{SUPABASE_URL.rstrip('/')}/storage/v1"
 # Supabase Storage signs upload URLs for a fixed 2 hours (server-side setting);
@@ -512,18 +522,58 @@ def delete_storage_object(path: str) -> None:
         print(f"   ⚠️ Could not delete storage object for expired upload ({type(error).__name__})")
 
 
-def download_storage_object_to_file(path: str, dest_path: str) -> None:
-    """Stream a private/public bucket object to disk using the service key (constant memory)."""
+class DownloadTooLarge(StorageError):
+    """The object is bigger than the download cap. Text matches jobs.is_retryable_error's
+    permanent patterns ("exceeds maximum"), so such a job fails instead of retrying."""
+
+
+def _stream_storage_object(path: str, write, max_bytes: Optional[int] = None) -> int:
+    """GET an object with the service key and feed it to `write(bytes)` in 1 MiB blocks.
+
+    The caller must pass a validated path (audio_access.validate_storage_path): this
+    function trusts it. Redirects are never followed, and the download is aborted as soon
+    as it exceeds `max_bytes` (default: MAX_DOWNLOAD_BYTES, 300 MiB), by Content-Length
+    first and by counting streamed bytes otherwise. Returns the number of bytes written.
+    """
+    limit = max_bytes or audio_access.max_download_bytes()
     url = f"{STORAGE_BASE_URL}/object/authenticated/{RECORDINGS_BUCKET}/{_quote_path(path)}"
+    total = 0
     try:
-        with storage_http.stream("GET", url, headers=_storage_headers(), timeout=httpx.Timeout(600.0, connect=15.0)) as response:
+        with storage_http.stream("GET", url, headers=_storage_headers(), follow_redirects=False,
+                                 timeout=httpx.Timeout(600.0, connect=15.0)) as response:
             if response.status_code >= 300:
                 raise StorageError(f"storage download returned HTTP {response.status_code}")
-            with open(dest_path, "wb") as out:
-                for block in response.iter_bytes(1024 * 1024):
-                    out.write(block)
+            declared = response.headers.get("content-length", "")
+            if declared.isdigit() and int(declared) > limit:
+                raise DownloadTooLarge(f"audio file exceeds maximum download size of {limit} bytes")
+            for block in response.iter_bytes(1024 * 1024):
+                total += len(block)
+                if total > limit:
+                    raise DownloadTooLarge(f"audio file exceeds maximum download size of {limit} bytes")
+                write(block)
     except httpx.HTTPError as error:
         raise StorageError(f"storage download failed ({type(error).__name__})") from None
+    return total
+
+
+def download_storage_object_to_file(path: str, dest_path: str, max_bytes: Optional[int] = None) -> None:
+    """Stream a bucket object to disk using the service key (constant memory, size-capped)."""
+    try:
+        with open(dest_path, "wb") as out:
+            _stream_storage_object(path, out.write, max_bytes)
+    except BaseException:
+        try:
+            os.remove(dest_path)
+        except OSError:
+            pass
+        raise
+
+
+def download_storage_object_bytes(path: str, max_bytes: Optional[int] = None) -> bytes:
+    """Download a bucket object into memory (size-capped); for the pydub/regular path."""
+    buffer = bytearray()
+    _stream_storage_object(path, buffer.extend, max_bytes)
+    return bytes(buffer)
 
 
 def _rows(response) -> list:

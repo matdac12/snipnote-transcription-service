@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 import httpx
 import support
+from support import TEST_USER_ID, TEST_AUDIO_URL, chunk_path_for
 import jobs
 import transcribe
 import transcription_provider as tp
@@ -260,10 +261,10 @@ class TranscribeXaiFileTests(EnvMixin, unittest.TestCase):
 class JobRoutingTests(EnvMixin, unittest.TestCase):
     """process_job / process_chunked_job routing between single-request and chunked paths."""
     def run_job(self, provider, chunked=False, single=None):
-        job = {'id': 'job', 'meeting_id': 'm', 'audio_url': 'https://offline.invalid/a', 'is_chunked': chunked,
+        job = {'id': 'job', 'user_id': TEST_USER_ID, 'meeting_id': 'm', 'audio_url': TEST_AUDIO_URL, 'is_chunked': chunked,
                'total_chunks': 2, 'language': 'it', 'transcription_provider': provider}
-        chunks = [{'id': 'c2', 'chunk_index': 1, 'file_path': 'two', 'duration_seconds': 5},
-                  {'id': 'c1', 'chunk_index': 0, 'file_path': 'one', 'duration_seconds': 7}]
+        chunks = [{'id': 'c2', 'chunk_index': 1, 'file_path': chunk_path_for(1), 'duration_seconds': 5},
+                  {'id': 'c1', 'chunk_index': 0, 'file_path': chunk_path_for(0), 'duration_seconds': 7}]
         names = ['update_job_status', 'update_job_progress', 'update_chunk_transcript', 'update_chunks_processed',
                  'increment_retry_count', 'update_job_with_results']
         m = {n: MagicMock() for n in names}
@@ -309,7 +310,7 @@ class JobRoutingTests(EnvMixin, unittest.TestCase):
         with patch.object(jobs, 'download_chunk_from_storage', return_value=b'x') as dl, tempfile.TemporaryDirectory() as d:
             for i, f in enumerate(fetchers):
                 f(os.path.join(d, str(i)))
-        self.assertEqual([c.args[0] for c in dl.call_args_list], ['one', 'two'])
+        self.assertEqual([c.args[0] for c in dl.call_args_list], [chunk_path_for(0), chunk_path_for(1)])
         m['update_chunk_transcript'].assert_not_called()
         m['update_chunks_processed'].assert_called_once_with('job', 2)
         kw = m['update_job_with_results'].call_args.kwargs
@@ -326,7 +327,7 @@ class JobRoutingTests(EnvMixin, unittest.TestCase):
         self.assertEqual(ta.call_count, 2)
 
     def test_single_request_auth_error_fails_job_without_fallback(self):
-        job = {'id': 'job', 'audio_url': 'u', 'transcription_provider': 'xai'}
+        job = {'id': 'job', 'user_id': TEST_USER_ID, 'audio_url': TEST_AUDIO_URL, 'transcription_provider': 'xai'}
         err = tp.TranscriptionProviderError('xAI transcription returned HTTP 401', 401)
         m = {n: MagicMock() for n in ('update_job_status', 'update_job_progress', 'increment_retry_count')}
         with patch.multiple(jobs, **m), \
@@ -339,19 +340,21 @@ class JobRoutingTests(EnvMixin, unittest.TestCase):
 
 
 class DownloadToFileTests(unittest.TestCase):
+    """Legacy audio_url downloads go through the service-key storage API (details: test_download_hardening)."""
     def test_streams_to_disk_in_blocks(self):
         payload = b'a' * (3 * 1024 * 1024 + 5)
         client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=payload)))
-        with patch.object(jobs, 'http_client', client), tempfile.TemporaryDirectory() as d:
+        with patch.object(support.supabase_client, 'storage_http', client), tempfile.TemporaryDirectory() as d:
             dest = os.path.join(d, 'f')
-            jobs.download_audio_to_file('https://offline.invalid/a', dest)
+            jobs.download_audio_to_file(TEST_AUDIO_URL, dest, TEST_USER_ID)
             self.assertEqual(open(dest, 'rb').read(), payload)
 
     def test_http_error_raises(self):
         client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(404)))
-        with patch.object(jobs, 'http_client', client), tempfile.TemporaryDirectory() as d:
-            with self.assertRaises(httpx.HTTPStatusError):
-                jobs.download_audio_to_file('https://offline.invalid/a', os.path.join(d, 'f'))
+        with patch.object(support.supabase_client, 'storage_http', client), tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(support.supabase_client.StorageError):
+                jobs.download_audio_to_file(TEST_AUDIO_URL, os.path.join(d, 'f'), TEST_USER_ID)
+            self.assertFalse(os.path.exists(os.path.join(d, 'f')))
 
 
 class OpenAIPathUnchangedTests(unittest.TestCase):
