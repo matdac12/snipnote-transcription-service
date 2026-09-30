@@ -395,3 +395,37 @@ def increment_retry_count(job_id: str, error_message: str) -> Dict[str, Any]:
     except Exception as e:
         print(f"❌ Error incrementing retry count for job {job_id}: {e}")
         raise
+
+
+# --- Live Activity (APNs) support -------------------------------------------------------
+# Used by apns.py from a background thread. Tokens are uploaded by the iOS app
+# (RLS: own rows only); the service key bypasses RLS to read/delete them.
+
+def update_job_stage(job_id: str, stage: str) -> None:
+    """Persist transcription_jobs.stage (queued|preparing|transcribing|summarizing|done|failed).
+
+    Deliberately separate from update_job_progress: if migration 007 has not been
+    applied yet this raises (caught by apns.py) instead of breaking job processing.
+    """
+    supabase.table("transcription_jobs").update({"stage": stage}).eq("id", job_id).execute()
+
+
+def get_live_activity_tokens(job_id: str) -> list[Dict[str, Any]]:
+    """Live Activity push tokens registered for a job (may be empty)."""
+    response = (
+        supabase.table("live_activity_tokens")
+        .select("token, environment, bundle_id")
+        .eq("job_id", job_id)
+        .execute()
+    )
+    return response.data or []
+
+
+def delete_live_activity_token(job_id: str, token: str) -> None:
+    """Remove one token (APNs said it is dead: 410 / BadDeviceToken / Unregistered)."""
+    supabase.table("live_activity_tokens").delete().eq("job_id", job_id).eq("token", token).execute()
+
+
+def delete_live_activity_tokens(job_id: str) -> None:
+    """Remove every token of a job (its Live Activity has ended)."""
+    supabase.table("live_activity_tokens").delete().eq("job_id", job_id).execute()

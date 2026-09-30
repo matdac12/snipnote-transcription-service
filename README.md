@@ -123,3 +123,12 @@ fallback to chunking; OpenAI keeps the chunked pipeline. Never store credentials
 migration, credentials, backend, then iOS order in
 [DEPLOYMENT.md](DEPLOYMENT.md#saved-transcription-provider-release). Paid staging
 smoke tests and deployment remain separate from offline implementation tests.
+
+## Live Activity pushes (optional)
+
+The worker can push transcription stage/progress to an iOS Live Activity / Dynamic Island
+through APNs (`apns.py`), including a final "ready"/"failed" alert when the app is closed.
+Enabled only when `APNS_KEY_P8`, `APNS_KEY_ID`, `APNS_TEAM_ID` and `APNS_BUNDLE_ID` are set;
+otherwise nothing changes. Setup: [DEPLOYMENT.md](DEPLOYMENT.md#live-activity-apns-pushes).
+Payload/ContentState contract for the iOS side: [docs/LIVE_ACTIVITY_CONTRACT.md](docs/LIVE_ACTIVITY_CONTRACT.md).
+Migrations: `migrations/006_*` (token table, RLS) and `migrations/007_*` (`transcription_jobs.stage`).
