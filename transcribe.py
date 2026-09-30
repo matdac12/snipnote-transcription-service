@@ -6,7 +6,7 @@ from functools import wraps
 from openai import OpenAI
 from pydub import AudioSegment
 
-from ai_config import create_transcription
+from transcription_provider import create_provider_transcription, validate_transcription_provider
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -45,7 +45,7 @@ def retry_with_backoff(max_retries: int = 3, base_delay: float = 1.0):
 
 
 @retry_with_backoff(max_retries=3, base_delay=2.0)
-def transcribe_chunk_with_retry(chunk_bytes: bytes, chunk_name: str, language: Optional[str] = None) -> str:
+def transcribe_chunk_with_retry(chunk_bytes: bytes, chunk_name: str, language: Optional[str] = None, provider: str = "openai") -> str:
     """
     Transcribe a single audio chunk with retry logic.
 
@@ -60,7 +60,7 @@ def transcribe_chunk_with_retry(chunk_bytes: bytes, chunk_name: str, language: O
     chunk_file = io.BytesIO(chunk_bytes)
     chunk_file.name = chunk_name
 
-    return create_transcription(client, chunk_file, language)
+    return create_provider_transcription(client, chunk_file, language, provider)
 
 # Constants matching iOS implementation
 MAX_CHUNK_SIZE_MB = 1.5
@@ -202,7 +202,8 @@ def transcribe_audio(
     audio_data: bytes,
     filename: str,
     progress_callback: Optional[Callable] = None,
-    language: Optional[str] = None
+    language: Optional[str] = None,
+    provider: str = "openai"
 ) -> dict:
     """
     Transcribe audio using the configured transcription model with automatic chunking for large files
@@ -216,6 +217,7 @@ def transcribe_audio(
     Returns:
         Dict with 'transcript' and 'duration' keys
     """
+    validate_transcription_provider(provider)
     file_size_bytes = len(audio_data)
 
     # Check if chunking is needed
@@ -227,7 +229,7 @@ def transcribe_audio(
             progress_callback(0, "Transcribing audio...")
 
         # Use retry-enabled transcription
-        transcript_text = transcribe_chunk_with_retry(audio_data, filename, language)
+        transcript_text = transcribe_chunk_with_retry(audio_data, filename, language, provider)
 
         # Calculate duration (rough estimate)
         duration = len(audio_data) / 32000
@@ -269,7 +271,8 @@ def transcribe_audio(
                 transcript_text = transcribe_chunk_with_retry(
                     chunk_bytes,
                     f"chunk_{chunk_num}.mp3",
-                    language
+                    language,
+                    provider
                 )
                 transcripts.append(transcript_text)
                 print(f"   ✅ Chunk {chunk_num} transcribed: {len(transcript_text)} chars")
