@@ -10,6 +10,7 @@ import warnings
 from supabase_client import create_job, get_job
 import auth
 import background_upload
+import audio_access
 
 # Suppress pydub regex warnings in Python 3.13+
 warnings.filterwarnings("ignore", category=SyntaxWarning, module="pydub")
@@ -175,6 +176,26 @@ async def create_transcription_job(
         raise HTTPException(status_code=500, detail=f"Failed to create job: {str(e)}")
 
 
+async def identify_caller(authorization: str | None, endpoint: str):
+    """AUTH_MODE-aware identity for the legacy endpoints (see auth.py).
+
+    Returns the verified user, or None when the request is anonymous and the mode allows it.
+    Raises 401/503 in `enforce` mode. Always counts the outcome (no PII) for the rollout."""
+    mode = auth.auth_mode()
+    if mode == "off":
+        return None
+    result = await run_in_threadpool(auth.resolve_user, authorization)
+    auth.note_request(endpoint, "authenticated" if result.user else result.problem)
+    if result.user:
+        return result.user
+    if mode == "enforce":
+        if result.problem == "unavailable":
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+        raise HTTPException(status_code=401, detail="Missing or invalid bearer token",
+                            headers={"WWW-Authenticate": "Bearer"})
+    return None
+
+
 async def create_upload_pending_job(request: CreateJobRequest, authorization: str | None):
     # JWT verification may fetch a JWKS and every step below is blocking I/O: keep it
     # off the event loop.
@@ -206,24 +227,39 @@ async def create_upload_pending_job(request: CreateJobRequest, authorization: st
 @app.get("/jobs/{job_id}", response_model=JobStatusResponse)
 async def get_job_status(
     job_id: str,
-    authenticated: bool = Depends(verify_api_key)
+    authenticated: bool = Depends(verify_api_key),
+    authorization: str | None = Header(None),
 ):
     """
     Get the status of a transcription job
 
     Returns job details including status, transcript (if completed), and timestamps.
+
+    Ownership (AUTH_MODE, see auth.py): `enforce` = 401 without a valid token and 404 unless the
+    job belongs to the token's user. `log` (default) = anonymous requests are still served (old app
+    builds send no token) but `audio_url` is withheld; a valid token of ANOTHER user always gets 404.
+    `off` = no token handling, `audio_url` is still withheld. `user_id` is always returned (the
+    iOS decoder requires it).
     """
+    if not audio_access.is_uuid(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    user = await identify_caller(authorization, "GET /jobs")
     try:
-        job = get_job(job_id)
-
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-
-        return JobStatusResponse(**job)
-    except HTTPException:
-        raise
+        job = await run_in_threadpool(get_job, job_id)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve job: {str(e)}")
+        print(f"❌ Failed to retrieve job {job_id}: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve job")
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    is_owner = bool(user) and str(job.get("user_id", "")).lower() == user.user_id
+    if user and not is_owner:
+        raise HTTPException(status_code=404, detail="Job not found")  # never reveal that it exists
+    response = JobStatusResponse(**job)
+    if not is_owner:
+        response.audio_url = None  # optional in the iOS model; a storage URL is a capability
+    return response
 
 
 @app.api_route("/transcribe", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], include_in_schema=False)

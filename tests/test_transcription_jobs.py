@@ -42,8 +42,9 @@ class JobTests(unittest.TestCase):
     def test_legacy_job_defaults_openai(self):
         self.assertEqual(self.api.post('/jobs', json=self.payload).status_code, 200)
         self.assertEqual(self.inserted[0].get('transcription_provider'), 'openai')
-        with patch.object(main, 'get_job', return_value={**self.payload, 'id': 'job', 'status': 'pending', 'created_at': '2026-09-30', 'updated_at': '2026-09-30'}):
-            self.assertEqual(self.api.get('/jobs/job').json().get('transcription_provider'), 'openai')
+        job_id = '3f2e1d0c-9b8a-4c7d-8e6f-5a4b3c2d1e0f'
+        with patch.object(main, 'get_job', return_value={**self.payload, 'id': job_id, 'status': 'pending', 'created_at': '2026-09-30', 'updated_at': '2026-09-30'}):
+            self.assertEqual(self.api.get(f'/jobs/{job_id}').json().get('transcription_provider'), 'openai')
 
     def test_explicit_invalid_provider_returns_422(self):
         for value in ['unknown', '', None]:
