@@ -260,6 +260,67 @@ Stop new xAI submissions and drain or explicitly fail pending xAI jobs before
 rolling workers back to versions that ignore provider, or they could transcribe
 those jobs using OpenAI. Keep xAI credentials until queued jobs are handled.
 
+### Migration order (all optional features)
+
+Apply in numeric order; 006 must be **committed** before 007 is run (`ALTER TYPE ... ADD VALUE`):
+
+| # | file | feature |
+|---|------|---------|
+| 006 | `006_add_awaiting_upload_status.sql` | background upload (enum value / CHECK) |
+| 007 | `007_background_upload_columns.sql` | background upload (columns, indexes; needs 006 committed) |
+| 008 | `008_create_live_activity_tokens_table.sql` | Live Activity tokens (+ RLS) |
+| 009 | `009_add_stage_to_transcription_jobs.sql` | `transcription_jobs.stage` |
+
+The APNs migrations were originally numbered 006/007 on their own branch; they were renumbered to
+008/009 when the two branches were integrated. If 006/007 of the *old* APNs numbering were
+already applied on some environment, nothing needs re-running (both are idempotent), only the
+file names differ.
+
+### Live Activity (APNs) pushes
+
+Optional. With all four `APNS_*` variables unset the worker behaves exactly as before.
+Contract with the iOS app: [`docs/LIVE_ACTIVITY_CONTRACT.md`](docs/LIVE_ACTIVITY_CONTRACT.md).
+
+1. **Apple key** (Apple Developer, Account owner/admin): Certificates, Identifiers & Profiles,
+   Keys, `+`. Name it, tick **Apple Push Notifications service (APNs)**, Continue, Register,
+   **Download** the `AuthKey_<KEYID>.p8` (only downloadable once). Note the **Key ID** (10 chars)
+   and your **Team ID** (Membership details). One key works for sandbox and production and for
+   every app of the team. The app's bundle ID must have Push Notifications enabled (the iOS
+   side also adds `NSSupportsLiveActivities` and the push capability, later).
+2. **Put the key on the VPS** (outside the git checkout):
+   ```bash
+   scp AuthKey_ABC123DEFG.p8 omni:/etc/snipnote-transcription/
+   ssh omni 'chown root:root /etc/snipnote-transcription/AuthKey_*.p8 && chmod 600 /etc/snipnote-transcription/AuthKey_*.p8'
+   ```
+   Then add to `/etc/snipnote-transcription/env` (see `deploy/env.example`):
+   `APNS_KEY_P8=/etc/snipnote-transcription/AuthKey_ABC123DEFG.p8`, `APNS_KEY_ID`,
+   `APNS_TEAM_ID`, `APNS_BUNDLE_ID`. The worker unit runs as root like the env file, so root-only
+   `600` is readable; if you ever run it as another user, `chown` the key to that user. Never
+   commit the `.p8`; never paste it into logs or chat.
+3. **Migrations** (Supabase SQL editor, in order, before deploying): `migrations/008_create_live_activity_tokens_table.sql`,
+   `migrations/009_add_stage_to_transcription_jobs.sql` (numbered after the background-upload
+   migrations 006/007; 008 references `transcription_jobs` only through its id, so it does not
+   need 006/007 to exist, but apply 006 -> 007 -> 008 -> 009 in order on a fresh project). The worker tolerates them being missing
+   (logs once, jobs unaffected), so order is not critical for safety.
+4. `git pull && .venv/bin/pip install -r requirements.txt && systemctl restart snipnote-worker`
+   (new deps: `httpx[http2]` -> `h2`, `PyJWT[crypto]`). Startup log says
+   `APNs: live activity pushes enabled (topic ...)` or `disabled (APNS_* not set)`.
+5. Verify: start a job from a debug build, watch `journalctl -u snipnote-worker -f | grep APNs`.
+   Only failures are logged (`job 1a2b3c4d token ...abcdef transcribing: 400 BadDeviceToken`).
+   Common reasons: `BadDeviceToken` (sandbox token on production or vice versa; the row is
+   deleted), `TopicDisallowed`/`DeviceTokenNotForTopic` (wrong `APNS_BUNDLE_ID`),
+   `InvalidProviderToken` (wrong key id / team id / key), `TooManyProviderTokenUpdates`.
+6. Roll back instantly: unset the `APNS_*` variables (or `LIVE_ACTIVITY_ENABLED=false`, which also
+   stops the `stage` column writes) and restart the worker.
+
+Behaviour: the notifier runs on one background thread; job threads only enqueue, so APNs or
+Supabase slowness never delays a job and any error is swallowed and logged by class name.
+Stage changes are always pushed, in-stage progress at most once per
+`APNS_PROGRESS_INTERVAL_SECONDS` (20 s). Done/failed send an `end` event with an alert (this
+also delivers "ready/failed" when the app is closed) and delete the job's tokens. The provider
+JWT is cached and re-minted every 50 minutes. A worker killed with SIGKILL can lose queued pushes;
+a clean exit flushes them (8 s cap).
+
 ### xAI single-request transcription
 
 For `transcription_provider: xai` the worker no longer uses the two-level chunking:
@@ -350,5 +411,5 @@ Offline verification (no production credentials):
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q main.py ai_config.py transcription_provider.py transcribe.py jobs.py supabase_client.py xai_single.py auth.py background_upload.py large_audio.py
+python -m compileall -q main.py ai_config.py transcription_provider.py transcribe.py jobs.py supabase_client.py xai_single.py auth.py background_upload.py large_audio.py apns.py
 ```

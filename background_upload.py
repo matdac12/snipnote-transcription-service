@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import supabase_client as db
+from apns import notify_stage  # Live Activity pushes + stage persistence; never raises, never blocks
 from transcription_provider import validate_transcription_provider
 
 DEFAULT_TTL_SECONDS = 6 * 3600
@@ -239,6 +240,10 @@ def promote_uploaded_jobs(now: Optional[datetime] = None) -> Dict[str, int]:
                 )
                 if won:
                     stats['promoted'] += 1
+                    # The upload is done and the job is now waiting for the worker: the Live
+                    # Activity moves from its upload state to "queued" (tokens may already exist,
+                    # the app registers them with the job_id it got from POST /jobs).
+                    notify_stage(job_id, 'queued', 0)
                     print(f'📥 Upload complete, job {job_id} promoted to pending ({size} bytes)')
                 continue
             if now >= _deadline(job):
@@ -249,6 +254,7 @@ def promote_uploaded_jobs(now: Optional[datetime] = None) -> Dict[str, int]:
                 )
                 if won:  # only the winner deletes, so a promoted job's file is never removed
                     stats['expired'] += 1
+                    notify_stage(job_id, 'failed')
                     detail = 'object absent' if size is None else f'size {size} != expected {job.get("expected_bytes")}'
                     print(f'⌛ Job {job_id} upload expired ({detail})')
                     if size is not None and path:

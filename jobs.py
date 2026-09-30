@@ -24,6 +24,7 @@ from ai_config import create_response
 import xai_single
 import large_audio
 import background_upload
+from apns import notify_stage  # Live Activity pushes + stage persistence; never raises, never blocks
 
 
 # Maximum retry attempts before permanent failure
@@ -434,12 +435,18 @@ def process_single_chunk(chunk: Dict[str, Any], total_chunks: int, language: str
         raise
 
 
+def xai_stage(stage_text: str) -> str:
+    """Map xai_single's human-readable progress text to a Live Activity stage."""
+    return "transcribing" if stage_text.lower().startswith("transcri") else "preparing"
+
+
 def transcribe_chunks_in_parallel(job_id: str, chunks: List[Dict[str, Any]], language, provider: str) -> str:
     """Existing chunked path: transcribe every upload chunk (threaded), merge in order."""
     # Step 3: Process chunks in PARALLEL (5-70% total progress)
     # Using ThreadPoolExecutor for 5-10x speedup on chunked jobs
     print(f"   🚀 Processing {len(chunks)} chunks in parallel (max {MAX_CHUNK_WORKERS} workers)...")
     update_job_progress(job_id, 10, f"Transcribing {len(chunks)} chunks in parallel...")
+    notify_stage(job_id, "transcribing", 10, chunk=0, total_chunks=len(chunks))
 
     # Track results by chunk_index to maintain order
     chunk_results: Dict[int, str] = {}
@@ -476,6 +483,7 @@ def transcribe_chunks_in_parallel(job_id: str, chunks: List[Dict[str, Any]], lan
                     f"Transcribed {completed_count}/{len(chunks)} chunks..."
                 )
                 update_chunks_processed(job_id, completed_count)
+                notify_stage(job_id, "transcribing", current_progress, chunk=completed_count, total_chunks=len(chunks))
 
             except Exception as e:
                 chunk_index = chunk.get("chunk_index", "?")
@@ -512,6 +520,7 @@ def process_chunked_job(job: Dict[str, Any]):
         print(f"   📦 Processing chunked job ({total_chunks} chunks)...")
         update_job_status(job_id, "processing")
         update_job_progress(job_id, 0, "Starting chunked transcription...")
+        notify_stage(job_id, "preparing", 0, total_chunks=total_chunks)
 
         # Step 2: Fetch all audio chunks from database
         print(f"   📋 Fetching audio chunks from database...")
@@ -532,7 +541,10 @@ def process_chunked_job(job: Dict[str, Any]):
                 [lambda dest, path=c["file_path"]: download_chunk_to_file(path, dest)
                  for c in sorted(chunks, key=lambda c: c["chunk_index"])],
                 language,
-                progress=lambda pct, stage: update_job_progress(job_id, 10 + int(pct * 0.6), stage),
+                progress=lambda pct, stage: (
+                    update_job_progress(job_id, 10 + int(pct * 0.6), stage),
+                    notify_stage(job_id, xai_stage(stage), 10 + int(pct * 0.6)),
+                ),
             )
         if single is not None:
             full_transcript = single.text
@@ -545,6 +557,7 @@ def process_chunked_job(job: Dict[str, Any]):
 
         # 5a: Summary (70-80%) - needs full transcript, must run first
         update_job_progress(job_id, 70, "Generating summary...")
+        notify_stage(job_id, "summarizing", 70)
         summary = generate_summary(full_transcript)
         update_job_progress(job_id, 80, "Summary generated")
 
@@ -581,6 +594,7 @@ def process_chunked_job(job: Dict[str, Any]):
             duration=duration
         )
 
+        notify_stage(job_id, "done", 100)
         print(f"✅ Chunked job {job_id} completed successfully!")
         print(f"   - Chunks processed: {len(chunks)}")
         print(f"   - Total transcript: {len(full_transcript)} chars")
@@ -598,6 +612,7 @@ def process_chunked_job(job: Dict[str, Any]):
                 # Retryable error - queue for retry
                 print(f"🔄 Chunked job {job_id} failed with retryable error (attempt {retry_count + 1}/{MAX_RETRY_ATTEMPTS}): {error_message}")
                 increment_retry_count(job_id, error_message)
+                notify_stage(job_id, "queued", 0, message="Retrying")
                 print(f"   📋 Job queued for retry on next cron run")
             else:
                 # Permanent error or max retries exceeded
@@ -608,6 +623,7 @@ def process_chunked_job(job: Dict[str, Any]):
                     print(f"❌ Chunked job {job_id} failed with permanent error: {error_message}")
 
                 update_job_status(job_id=job_id, status="failed", error=error_message)
+                notify_stage(job_id, "failed")
                 update_job_progress(job_id, 0, f"Failed: {error_message[:50]}...")
                 print(f"   💾 Error saved to database")
         except Exception as update_error:
@@ -619,16 +635,19 @@ def transcribe_regular_job_audio(job_id: str, audio_url: str, language, provider
     # Step 2: Download audio (0-10%)
     print(f"   📥 Downloading audio...")
     update_job_progress(job_id, 5, "Downloading audio...")
+    notify_stage(job_id, "preparing", 5)
     audio_data = download_audio(audio_url)
     update_job_progress(job_id, 10, "Audio downloaded")
 
     # Step 3: Transcribe using OpenAI Whisper (10-60%)
     print(f"   🎤 Transcribing audio...")
+    notify_stage(job_id, "transcribing", 10)
 
     def transcription_progress(pct: float, stage: str):
         """Callback to report transcription progress (maps 0-100 to 10-60)"""
         adjusted_pct = 10 + int(pct * 0.5)  # Scale to 10-60% range
         update_job_progress(job_id, adjusted_pct, stage)
+        notify_stage(job_id, "transcribing", adjusted_pct)
 
     result = transcribe_audio(
         audio_data,
@@ -657,6 +676,7 @@ def transcribe_uploaded_job_audio(job_id: str, job: Dict[str, Any], language, pr
     with large_audio.temp_workdir() as workdir:
         print(f"   📥 Downloading uploaded audio...")
         update_job_progress(job_id, 5, "Downloading audio...")
+        notify_stage(job_id, "preparing", 5)
         source = os.path.join(workdir, f"source.{ext}")
         download_storage_object_to_file(path, source)
         size = os.path.getsize(source)
@@ -664,6 +684,7 @@ def transcribe_uploaded_job_audio(job_id: str, job: Dict[str, Any], language, pr
         if isinstance(expected, int) and expected > 0 and size != expected:
             raise Exception(f"Downloaded audio size {size} does not match expected {expected} bytes (network error)")
         update_job_progress(job_id, 10, "Audio downloaded")
+        notify_stage(job_id, "transcribing", 10)
 
         # Size alone is a poor proxy for memory use (a 14 MB low-bitrate file can be hours
         # of audio), so also use the client-reported duration, else ffprobe.
@@ -672,7 +693,10 @@ def transcribe_uploaded_job_audio(job_id: str, job: Dict[str, Any], language, pr
             print(f"   ✂️ Large file ({size / 1024 / 1024:.1f} MB, {audio_seconds}s): segmenting with ffmpeg")
             return large_audio.transcribe_large_file(
                 source, workdir, language, provider,
-                progress=lambda pct, stage: update_job_progress(job_id, 10 + int(pct * 0.5), stage),
+                progress=lambda pct, stage: (
+                    update_job_progress(job_id, 10 + int(pct * 0.5), stage),
+                    notify_stage(job_id, "transcribing", 10 + int(pct * 0.5)),
+                ),
                 duration_hint=audio_seconds, workers=MAX_CHUNK_WORKERS,
             )
 
@@ -680,7 +704,10 @@ def transcribe_uploaded_job_audio(job_id: str, job: Dict[str, Any], language, pr
             audio_data = f.read()
         result = transcribe_audio(
             audio_data, f"audio.{ext}",
-            progress_callback=lambda pct, stage: update_job_progress(job_id, 10 + int(pct * 0.5), stage),
+            progress_callback=lambda pct, stage: (
+                update_job_progress(job_id, 10 + int(pct * 0.5), stage),
+                notify_stage(job_id, "transcribing", 10 + int(pct * 0.5)),
+            ),
             language=language, provider=provider,
         )
         return result["transcript"], result["duration"]
@@ -716,6 +743,7 @@ def process_job(job: Dict[str, Any]):
         print(f"   ⚙️  Updating status to 'processing'...")
         update_job_status(job_id, "processing")
         update_job_progress(job_id, 0, "Starting job...")
+        notify_stage(job_id, "preparing", 0)
 
         # Steps 2-3: transcript. xAI jobs try ONE request for the whole audio first
         # and fall back to the existing download + chunked path when it declines.
@@ -725,7 +753,10 @@ def process_job(job: Dict[str, Any]):
                 [(lambda dest: download_storage_object_to_file(storage_path, dest)) if storage_path
                  else (lambda dest: download_audio_to_file(audio_url, dest))],
                 language,
-                progress=lambda pct, stage: update_job_progress(job_id, 5 + int(pct * 0.55), stage),
+                progress=lambda pct, stage: (
+                    update_job_progress(job_id, 5 + int(pct * 0.55), stage),
+                    notify_stage(job_id, xai_stage(stage), 5 + int(pct * 0.55)),
+                ),
             )
         if single is not None:
             transcript = single.text
@@ -741,6 +772,7 @@ def process_job(job: Dict[str, Any]):
 
         # 4a: Summary (60-75%) - needs full transcript, must run first
         update_job_progress(job_id, 60, "Generating summary...")
+        notify_stage(job_id, "summarizing", 60)
         summary = generate_summary(transcript)
         update_job_progress(job_id, 75, "Summary generated")
 
@@ -771,6 +803,7 @@ def process_job(job: Dict[str, Any]):
         )
         # update_job_with_results automatically sets progress to 100% and stage to "Complete"
 
+        notify_stage(job_id, "done", 100)
         print(f"✅ Job {job_id} completed successfully!")
         print(f"   - Transcript: {len(transcript)} chars")
         print(f"   - Overview: {overview[:80]}...")
@@ -787,6 +820,7 @@ def process_job(job: Dict[str, Any]):
                 # Retryable error - queue for retry
                 print(f"🔄 Job {job_id} failed with retryable error (attempt {retry_count + 1}/{MAX_RETRY_ATTEMPTS}): {error_message}")
                 increment_retry_count(job_id, error_message)
+                notify_stage(job_id, "queued", 0, message="Retrying")
                 print(f"   📋 Job queued for retry on next cron run")
             else:
                 # Permanent error or max retries exceeded
@@ -801,6 +835,7 @@ def process_job(job: Dict[str, Any]):
                     status="failed",
                     error=error_message
                 )
+                notify_stage(job_id, "failed")
                 update_job_progress(job_id, 0, f"Failed: {error_message[:50]}...")
                 print(f"   💾 Error saved to database")
         except Exception as update_error:
