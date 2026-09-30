@@ -90,6 +90,12 @@ The `render.yaml` file automatically configures both the web service and cron wo
   [DEPLOYMENT.md](DEPLOYMENT.md#background-upload-upload_pending). The user comes from the
   verified JWT (`auth.py`), never from the body. Legacy requests (no `upload_pending`) behave as before.
 
+### Auth and limits (legacy endpoints)
+`AUTH_MODE=off|log|enforce` (default `log`) controls whether `GET /jobs/{id}` and legacy `POST /jobs` need a Supabase
+user token and ownership; old app builds keep working in `log`. Details: [DEPLOYMENT.md](DEPLOYMENT.md#security-hardening-audit-of-2026-09-30)
+and [docs/SECURITY_AND_MINUTES_ROLLOUT.md](docs/SECURITY_AND_MINUTES_ROLLOUT.md). Optional server-side minutes debit
+(`SERVER_MINUTES_DEBIT_ENABLED`, default off) is described there too.
+
 ### Removed: `/transcribe`
 `POST /transcribe` (synchronous, unauthenticated, ran the provider inside the API process) now
 answers **410 Gone**; the iOS app never called it. Use `POST /jobs`.

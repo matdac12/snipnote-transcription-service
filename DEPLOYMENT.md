@@ -294,8 +294,8 @@ cannot be queried never block a request. `upload_pending` creation always requir
 `GET` answers never include `audio_url` for non-owners; `user_id` is always present (the iOS decoder
 requires it). Rollout: deploy in `log`, watch the `[auth] ... missing` lines shrink after the iOS
 release (see "iOS follow-ups" in docs/SECURITY_AND_MINUTES_ROLLOUT.md), then set `AUTH_MODE=enforce`
-and restart `snipnote-api`. Enforcing early makes old builds' polls fail (they surface as polling
-errors and trigger the on-device fallback, so pair it with a force-update).
+and restart `snipnote-api`. Enforcing early makes old builds' polls fail with 401 (their code logs a polling
+error and keeps polling, so the user never sees the result: pair it with a force-update).
 
 **Worker download hardening (code).** Legacy `audio_url` jobs used to be fetched with
 `follow_redirects=True`, no host check and no size cap (SSRF against the box, OOM). Now
@@ -325,6 +325,11 @@ Apply in numeric order; 006 must be **committed** before 007 is run (`ALTER TYPE
 | 007 | `007_background_upload_columns.sql` | background upload (columns, indexes; needs 006 committed) |
 | 008 | `008_create_live_activity_tokens_table.sql` | Live Activity tokens (+ RLS) |
 | 009 | `009_add_stage_to_transcription_jobs.sql` | `transcription_jobs.stage` |
+| 010 | `010_harden_transcription_jobs_rls.sql` | clients may only write `status='completed'` result columns (check the iOS writes first) |
+| 011 | `011_server_minutes_debit.sql` | OPTIONAL: server minutes debit; read its header, aborts without the ledger functions |
+| 012 | `012_enable_rls_audio_chunks.sql` | OPTIONAL: RLS on `audio_chunks` |
+
+Details, env vars, the owner runbook and the iOS follow-ups: [docs/SECURITY_AND_MINUTES_ROLLOUT.md](docs/SECURITY_AND_MINUTES_ROLLOUT.md).
 
 The APNs migrations were originally numbered 006/007 on their own branch; they were renumbered to
 008/009 when the two branches were integrated. If 006/007 of the *old* APNs numbering were
@@ -466,5 +471,7 @@ Offline verification (no production credentials):
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q main.py ai_config.py transcription_provider.py transcribe.py jobs.py supabase_client.py xai_single.py auth.py background_upload.py large_audio.py apns.py
+# optional: also executes migrations 006-012 on an embedded PostgreSQL 16 (mock Supabase + mock ledger)
+pip install pgserver psycopg2-binary
+python -m compileall -q main.py ai_config.py transcription_provider.py transcribe.py jobs.py supabase_client.py xai_single.py auth.py background_upload.py large_audio.py apns.py audio_access.py job_policy.py minutes.py
 ```
