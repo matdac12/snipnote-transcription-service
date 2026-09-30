@@ -83,7 +83,7 @@ def _allowed_hosts() -> set:
 
 
 def validate_storage_path(path: object, user_id: object) -> str:
-    """Return `path` (normalised) if it is `<user_id>/<name...>` with no traversal, else raise."""
+    """Return `path` unchanged if it is `<user_id>/<name...>` (user id compared case-insensitively) with no traversal, else raise."""
     if not is_uuid(user_id):
         raise AudioAccessError('job has no valid user id')
     if not isinstance(path, str) or not path or len(path) > 512:
@@ -95,7 +95,8 @@ def validate_storage_path(path: object, user_id: object) -> str:
         raise AudioAccessError('storage path is not <user>/<file>')
     if segments[0].lower() != str(user_id).lower():
         raise AudioAccessError('storage path belongs to another user')
-    return '/'.join([segments[0].lower(), *segments[1:]])
+    # Returned exactly as stored: Storage paths are case-sensitive and the owner match above is not.
+    return path
 
 
 def storage_path_from_url(audio_url: object, user_id: object) -> str:

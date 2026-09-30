@@ -39,7 +39,8 @@ class UrlValidationTests(unittest.TestCase):
             self.assertEqual(self.ok(url(f'{TEST_USER_ID}/a.m4a', kind, query='?token=abc')), f'{TEST_USER_ID}/a.m4a')
 
     def test_user_id_comparison_is_case_insensitive(self):
-        self.assertEqual(self.ok(url(f'{TEST_USER_ID.upper()}/a.m4a'), TEST_USER_ID.upper()), f'{TEST_USER_ID}/a.m4a')
+        # Storage paths are case-sensitive: the path is used exactly as stored, only the owner match ignores case.
+        self.assertEqual(self.ok(url(f'{TEST_USER_ID.upper()}/a.m4a'), TEST_USER_ID), f'{TEST_USER_ID.upper()}/a.m4a')
         self.assertEqual(self.ok(url(f'{TEST_USER_ID}/a.m4a'), TEST_USER_ID.upper()), f'{TEST_USER_ID}/a.m4a')
 
     def test_ssrf_targets_are_rejected(self):
