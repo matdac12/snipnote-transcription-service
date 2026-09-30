@@ -1,4 +1,3 @@
-import os
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -23,10 +22,6 @@ class JobTests(unittest.TestCase):
             return table
         table.insert.side_effect = insert
         self.addCleanup(self.table_patch.stop)
-        # These tests cover the chunked xAI path; single-request has its own tests.
-        env = patch.dict(os.environ, {'XAI_SINGLE_REQUEST_ENABLED': 'false'})
-        env.start()
-        self.addCleanup(env.stop)
 
     def test_regular_job_persists_xai(self):
         response = self.api.post('/jobs', json={**self.payload, 'transcription_provider': 'xai'})

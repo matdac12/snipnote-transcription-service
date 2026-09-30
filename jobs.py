@@ -20,7 +20,6 @@ from supabase_client import (
 )
 from transcribe import transcribe_audio
 from ai_config import create_response
-import xai_single
 
 
 # Maximum retry attempts before permanent failure
@@ -202,16 +201,6 @@ def download_audio(audio_url: str) -> bytes:
     return response.content
 
 
-def download_audio_to_file(audio_url: str, dest_path: str) -> None:
-    """Stream an audio URL to disk (constant memory; used by the xAI single-request path)."""
-    print(f"   📥 Streaming audio to disk from {audio_url[:50]}...")
-    with http_client.stream("GET", audio_url, follow_redirects=True) as response:
-        response.raise_for_status()
-        with open(dest_path, "wb") as out:
-            for block in response.iter_bytes(1024 * 1024):
-                out.write(block)
-
-
 @retry_with_backoff(max_retries=3, base_delay=1.0)
 def generate_overview(summary: str) -> str:
     """Generate 1-sentence meeting overview from summary (model from ai_model_config)"""
@@ -386,13 +375,6 @@ def download_chunk_from_storage(chunk_file_path: str) -> bytes:
         raise
 
 
-def download_chunk_to_file(chunk_file_path: str, dest_path: str) -> None:
-    """Download one storage chunk straight to disk (the bytes are released right after writing)."""
-    data = download_chunk_from_storage(chunk_file_path)
-    with open(dest_path, "wb") as out:
-        out.write(data)
-
-
 def process_single_chunk(chunk: Dict[str, Any], total_chunks: int, language: str = None, provider: str = "openai") -> Dict[str, Any]:
     """
     Process a single audio chunk: download and transcribe.
@@ -431,66 +413,6 @@ def process_single_chunk(chunk: Dict[str, Any], total_chunks: int, language: str
         raise
 
 
-def transcribe_chunks_in_parallel(job_id: str, chunks: List[Dict[str, Any]], language, provider: str) -> str:
-    """Existing chunked path: transcribe every upload chunk (threaded), merge in order."""
-    # Step 3: Process chunks in PARALLEL (5-70% total progress)
-    # Using ThreadPoolExecutor for 5-10x speedup on chunked jobs
-    print(f"   🚀 Processing {len(chunks)} chunks in parallel (max {MAX_CHUNK_WORKERS} workers)...")
-    update_job_progress(job_id, 10, f"Transcribing {len(chunks)} chunks in parallel...")
-
-    # Track results by chunk_index to maintain order
-    chunk_results: Dict[int, str] = {}
-    completed_count = 0
-
-    with ThreadPoolExecutor(max_workers=MAX_CHUNK_WORKERS) as executor:
-        # Submit all chunks for parallel processing
-        future_to_chunk = {
-            executor.submit(process_single_chunk, chunk, len(chunks), language, provider): chunk
-            for chunk in chunks
-        }
-
-        # Process completed chunks as they finish
-        for future in as_completed(future_to_chunk):
-            chunk = future_to_chunk[future]
-            try:
-                result = future.result()
-                chunk_id = result["chunk_id"]
-                chunk_index = result["chunk_index"]
-                transcript = result["transcript"]
-
-                # Save transcript to database
-                update_chunk_transcript(chunk_id, transcript)
-
-                # Store result by index for ordered merging later
-                chunk_results[chunk_index] = transcript
-
-                # Update progress
-                completed_count += 1
-                current_progress = 5 + int((completed_count / len(chunks)) * 65)
-                update_job_progress(
-                    job_id,
-                    current_progress,
-                    f"Transcribed {completed_count}/{len(chunks)} chunks..."
-                )
-                update_chunks_processed(job_id, completed_count)
-
-            except Exception as e:
-                chunk_index = chunk.get("chunk_index", "?")
-                print(f"   ❌ Chunk {chunk_index} failed: {e}")
-                raise
-
-    # Build ordered transcripts list from results
-    transcripts = [chunk_results[i] for i in sorted(chunk_results.keys())]
-    print(f"   ✅ All {len(transcripts)} chunks transcribed in parallel")
-
-    # Step 4: Merge transcripts (70%)
-    print(f"   🔗 Merging {len(transcripts)} chunk transcripts...")
-    update_job_progress(job_id, 70, "Merging transcripts...")
-    full_transcript = "\n".join(transcripts)
-    print(f"   ✅ Merged transcript: {len(full_transcript)} chars")
-    return full_transcript
-
-
 def process_chunked_job(job: Dict[str, Any]):
     """
     Process a chunked transcription job
@@ -521,22 +443,61 @@ def process_chunked_job(job: Dict[str, Any]):
         if len(chunks) != total_chunks:
             print(f"   ⚠️ Expected {total_chunks} chunks, found {len(chunks)}")
 
-        # Steps 3-4: transcript. xAI jobs try ONE request for the whole audio first
-        # and fall back to the existing chunked path (unchanged) when it declines.
-        single = None
-        if xai_single.should_use_single_request(provider):
-            single = xai_single.run_single_request(
-                [lambda dest, path=c["file_path"]: download_chunk_to_file(path, dest)
-                 for c in sorted(chunks, key=lambda c: c["chunk_index"])],
-                language,
-                progress=lambda pct, stage: update_job_progress(job_id, 10 + int(pct * 0.6), stage),
-            )
-        if single is not None:
-            full_transcript = single.text
-            update_chunks_processed(job_id, len(chunks))
-            print(f"   ✅ Single-request transcript: {len(full_transcript)} chars")
-        else:
-            full_transcript = transcribe_chunks_in_parallel(job_id, chunks, language, provider)
+        # Step 3: Process chunks in PARALLEL (5-70% total progress)
+        # Using ThreadPoolExecutor for 5-10x speedup on chunked jobs
+        print(f"   🚀 Processing {len(chunks)} chunks in parallel (max {MAX_CHUNK_WORKERS} workers)...")
+        update_job_progress(job_id, 10, f"Transcribing {len(chunks)} chunks in parallel...")
+
+        # Track results by chunk_index to maintain order
+        chunk_results: Dict[int, str] = {}
+        completed_count = 0
+
+        with ThreadPoolExecutor(max_workers=MAX_CHUNK_WORKERS) as executor:
+            # Submit all chunks for parallel processing
+            future_to_chunk = {
+                executor.submit(process_single_chunk, chunk, len(chunks), language, provider): chunk
+                for chunk in chunks
+            }
+
+            # Process completed chunks as they finish
+            for future in as_completed(future_to_chunk):
+                chunk = future_to_chunk[future]
+                try:
+                    result = future.result()
+                    chunk_id = result["chunk_id"]
+                    chunk_index = result["chunk_index"]
+                    transcript = result["transcript"]
+
+                    # Save transcript to database
+                    update_chunk_transcript(chunk_id, transcript)
+
+                    # Store result by index for ordered merging later
+                    chunk_results[chunk_index] = transcript
+
+                    # Update progress
+                    completed_count += 1
+                    current_progress = 5 + int((completed_count / len(chunks)) * 65)
+                    update_job_progress(
+                        job_id,
+                        current_progress,
+                        f"Transcribed {completed_count}/{len(chunks)} chunks..."
+                    )
+                    update_chunks_processed(job_id, completed_count)
+
+                except Exception as e:
+                    chunk_index = chunk.get("chunk_index", "?")
+                    print(f"   ❌ Chunk {chunk_index} failed: {e}")
+                    raise
+
+        # Build ordered transcripts list from results
+        transcripts = [chunk_results[i] for i in sorted(chunk_results.keys())]
+        print(f"   ✅ All {len(transcripts)} chunks transcribed in parallel")
+
+        # Step 4: Merge transcripts (70%)
+        print(f"   🔗 Merging {len(transcripts)} chunk transcripts...")
+        update_job_progress(job_id, 70, "Merging transcripts...")
+        full_transcript = "\n".join(transcripts)
+        print(f"   ✅ Merged transcript: {len(full_transcript)} chars")
 
         # Step 5: Generate AI content (70-90%)
 
@@ -566,8 +527,6 @@ def process_chunked_job(job: Dict[str, Any]):
         duration = job.get("duration")
         if not duration:
             duration = sum(chunk.get("duration_seconds", 0) for chunk in chunks)
-        if not duration and single is not None:
-            duration = single.duration  # measured with ffprobe on the prepared audio
 
         update_job_with_results(
             job_id=job_id,
@@ -611,35 +570,6 @@ def process_chunked_job(job: Dict[str, Any]):
             print(f"   ⚠️  Failed to update job status: {update_error}")
 
 
-def transcribe_regular_job_audio(job_id: str, audio_url: str, language, provider: str):
-    """Existing regular path: download into memory, transcribe (chunked internally), return (text, duration)."""
-    # Step 2: Download audio (0-10%)
-    print(f"   📥 Downloading audio...")
-    update_job_progress(job_id, 5, "Downloading audio...")
-    audio_data = download_audio(audio_url)
-    update_job_progress(job_id, 10, "Audio downloaded")
-
-    # Step 3: Transcribe using OpenAI Whisper (10-60%)
-    print(f"   🎤 Transcribing audio...")
-
-    def transcription_progress(pct: float, stage: str):
-        """Callback to report transcription progress (maps 0-100 to 10-60)"""
-        adjusted_pct = 10 + int(pct * 0.5)  # Scale to 10-60% range
-        update_job_progress(job_id, adjusted_pct, stage)
-
-    result = transcribe_audio(
-        audio_data,
-        "audio.m4a",
-        progress_callback=transcription_progress,
-        language=language,
-        provider=provider
-    )
-
-    transcript = result["transcript"]
-    duration = result["duration"]
-    return transcript, duration
-
-
 def process_job(job: Dict[str, Any]):
     """
     Process a single transcription job with full AI pipeline and progress tracking
@@ -669,20 +599,30 @@ def process_job(job: Dict[str, Any]):
         update_job_status(job_id, "processing")
         update_job_progress(job_id, 0, "Starting job...")
 
-        # Steps 2-3: transcript. xAI jobs try ONE request for the whole audio first
-        # and fall back to the existing download + chunked path when it declines.
-        single = None
-        if xai_single.should_use_single_request(provider):
-            single = xai_single.run_single_request(
-                [lambda dest: download_audio_to_file(audio_url, dest)],
-                language,
-                progress=lambda pct, stage: update_job_progress(job_id, 5 + int(pct * 0.55), stage),
-            )
-        if single is not None:
-            transcript = single.text
-            duration = single.duration
-        else:
-            transcript, duration = transcribe_regular_job_audio(job_id, audio_url, language, provider)
+        # Step 2: Download audio (0-10%)
+        print(f"   📥 Downloading audio...")
+        update_job_progress(job_id, 5, "Downloading audio...")
+        audio_data = download_audio(audio_url)
+        update_job_progress(job_id, 10, "Audio downloaded")
+
+        # Step 3: Transcribe using OpenAI Whisper (10-60%)
+        print(f"   🎤 Transcribing audio...")
+
+        def transcription_progress(pct: float, stage: str):
+            """Callback to report transcription progress (maps 0-100 to 10-60)"""
+            adjusted_pct = 10 + int(pct * 0.5)  # Scale to 10-60% range
+            update_job_progress(job_id, adjusted_pct, stage)
+
+        result = transcribe_audio(
+            audio_data,
+            "audio.m4a",
+            progress_callback=transcription_progress,
+            language=language,
+            provider=provider
+        )
+
+        transcript = result["transcript"]
+        duration = result["duration"]
 
         print(f"   ✅ Transcription complete: {len(transcript)} chars, {duration:.1f}s")
 

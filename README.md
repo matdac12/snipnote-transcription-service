@@ -117,9 +117,7 @@ Models resolve from Supabase `ai_model_config` rows `transcription` and
 `transcription_xai` (60-second cache). Only transcription changes; summary,
 overview and actions keep their current configuration. xAI uses `XAI_API_KEY`
 from the VPS environment; Supabase Edge Function secrets are configured
-separately. xAI jobs transcribe the whole audio in one request (see
-[DEPLOYMENT.md](DEPLOYMENT.md#xai-single-request-transcription)) with automatic
-fallback to chunking; OpenAI keeps the chunked pipeline. Never store credentials in model rows or iOS. Follow the additive
+separately. Never store credentials in model rows or iOS. Follow the additive
 migration, credentials, backend, then iOS order in
 [DEPLOYMENT.md](DEPLOYMENT.md#saved-transcription-provider-release). Paid staging
 smoke tests and deployment remain separate from offline implementation tests.
