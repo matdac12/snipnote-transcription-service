@@ -209,7 +209,8 @@ def update_job_with_results(
     overview: str,
     summary: str,
     actions: list,
-    duration: float
+    duration: float,
+    billable_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Update job with all AI-generated results
@@ -221,6 +222,9 @@ def update_job_with_results(
         summary: Comprehensive meeting summary
         actions: List of action items
         duration: Audio duration in seconds
+        billable_seconds: only with SERVER_MINUTES_DEBIT_ENABLED: what the server will bill
+            (migration 011 column). Left out entirely when None, so nothing depends on the
+            migration unless billing is on.
 
     Returns:
         Dict containing updated job data
@@ -240,8 +244,18 @@ def update_job_with_results(
             "current_stage": "Complete",
             "completed_at": datetime.utcnow().isoformat()
         }
+        if billable_seconds is not None:
+            update_data["billable_seconds"] = billable_seconds
 
-        response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).execute()
+        try:
+            response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).execute()
+        except Exception as error:
+            if billable_seconds is None or "billable_seconds" not in str(error):
+                raise
+            # Billing was switched on before migration 011 was applied: never lose a finished job over it.
+            print("❌ BILLING MISCONFIGURED: transcription_jobs.billable_seconds is missing (apply migration 011); saving results without it")
+            update_data.pop("billable_seconds")
+            response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).execute()
 
         if response.data and len(response.data) > 0:
             job = response.data[0]
@@ -295,6 +309,36 @@ def get_audio_chunks(meeting_id: str, user_id: str) -> list[Dict[str, Any]]:
     except Exception as e:
         print(f"❌ Error fetching audio chunks for meeting {meeting_id}: {e}")
         raise
+
+
+# --- Server-side minutes (migration 011; all calls are service-role RPCs) --------------------
+
+def debit_minutes_for_job(user_id: str, meeting_id: str, job_id: str, minutes: int,
+                          seconds: Optional[float], provider: Optional[str]) -> Dict[str, Any]:
+    """Idempotent debit through public.debit_minutes_for_job. Returns its jsonb result."""
+    response = supabase.rpc("debit_minutes_for_job", {
+        "p_user_id": user_id, "p_meeting_id": meeting_id, "p_job_id": job_id,
+        "p_minutes": minutes, "p_seconds": seconds, "p_provider": provider,
+    }).execute()
+    return response.data if isinstance(response.data, dict) else {}
+
+
+def get_minutes_balance(user_id: str) -> Optional[int]:
+    """Balance in minutes through public.get_minutes_balance_for_user, or None if unknown."""
+    response = supabase.rpc("get_minutes_balance_for_user", {"p_user_id": user_id}).execute()
+    value = response.data
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def list_undebited_completed_jobs(since_iso: str, limit: int = 25) -> list[Dict[str, Any]]:
+    """Completed, billable (billable_seconds set by the worker), not yet debited, recently finished."""
+    response = (
+        supabase.table("transcription_jobs")
+        .select("id, user_id, meeting_id, billable_seconds, transcription_provider")
+        .eq("status", "completed").is_("debited_at", "null").not_.is_("billable_seconds", "null")
+        .gte("completed_at", since_iso).order("completed_at").limit(limit).execute()
+    )
+    return response.data or []
 
 
 # --- Ownership / quota lookups used by POST /jobs (service key; RLS does not apply) ----------

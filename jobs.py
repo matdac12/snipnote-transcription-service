@@ -4,7 +4,7 @@ import os
 import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Any, Callable
+from typing import List, Dict, Any, Callable, Optional
 from functools import wraps
 from openai import OpenAI
 from supabase_client import (
@@ -20,6 +20,7 @@ from supabase_client import (
     download_storage_object_bytes,
 )
 import audio_access
+import minutes
 from transcribe import transcribe_audio
 from ai_config import create_response
 import xai_single
@@ -414,6 +415,7 @@ def process_single_chunk(chunk: Dict[str, Any], total_chunks: int, language: str
     try:
         # Download chunk from storage
         chunk_data = download_chunk_from_storage(file_path)
+        seconds = measure_audio_seconds(chunk_data) if minutes.debit_enabled() else None  # billing only
 
         # Transcribe chunk
         print(f"   🎤 Transcribing chunk {chunk_index + 1}/{total_chunks}...")
@@ -425,7 +427,8 @@ def process_single_chunk(chunk: Dict[str, Any], total_chunks: int, language: str
         return {
             "chunk_id": chunk_id,
             "chunk_index": chunk_index,
-            "transcript": transcript
+            "transcript": transcript,
+            "seconds": seconds,
         }
     except Exception as e:
         print(f"   ❌ Chunk {chunk_index + 1}/{total_chunks} failed: {e}")
@@ -437,8 +440,11 @@ def xai_stage(stage_text: str) -> str:
     return "transcribing" if stage_text.lower().startswith("transcri") else "preparing"
 
 
-def transcribe_chunks_in_parallel(job_id: str, chunks: List[Dict[str, Any]], language, provider: str) -> str:
-    """Existing chunked path: transcribe every upload chunk (threaded), merge in order."""
+def transcribe_chunks_in_parallel(job_id: str, chunks: List[Dict[str, Any]], language, provider: str,
+                                  measured: Optional[List[Optional[float]]] = None) -> str:
+    """Existing chunked path: transcribe every upload chunk (threaded), merge in order.
+
+    `measured`, if given, receives each chunk's ffprobe duration (None = unmeasured); billing only."""
     # Step 3: Process chunks in PARALLEL (5-70% total progress)
     # Using ThreadPoolExecutor for 5-10x speedup on chunked jobs
     print(f"   🚀 Processing {len(chunks)} chunks in parallel (max {MAX_CHUNK_WORKERS} workers)...")
@@ -470,6 +476,8 @@ def transcribe_chunks_in_parallel(job_id: str, chunks: List[Dict[str, Any]], lan
 
                 # Store result by index for ordered merging later
                 chunk_results[chunk_index] = transcript
+                if measured is not None:
+                    measured.append(result.get("seconds"))
 
                 # Update progress
                 completed_count += 1
@@ -555,7 +563,8 @@ def process_chunked_job(job: Dict[str, Any]):
             update_chunks_processed(job_id, len(chunks))
             print(f"   ✅ Single-request transcript: {len(full_transcript)} chars")
         else:
-            full_transcript = transcribe_chunks_in_parallel(job_id, chunks, language, provider)
+            chunk_seconds: List[Optional[float]] = []
+            full_transcript = transcribe_chunks_in_parallel(job_id, chunks, language, provider, measured=chunk_seconds)
 
         # Step 5: Generate AI content (70-90%)
 
@@ -589,16 +598,26 @@ def process_chunked_job(job: Dict[str, Any]):
         if not duration and single is not None:
             duration = single.duration  # measured with ffprobe on the prepared audio
 
+        # Billing length (only used with SERVER_MINUTES_DEBIT_ENABLED): ffprobe-measured when the
+        # single request ran or every chunk could be probed, else what the app reported.
+        billing_seconds = None
+        if minutes.debit_enabled():
+            measured_total = single.duration if single is not None else (
+                sum(chunk_seconds) if chunk_seconds and len(chunk_seconds) == len(chunks) and all(chunk_seconds) else None)
+            billing_seconds = minutes.choose_billing_seconds(measured_total, [job.get("duration"), sum(c.get("duration_seconds") or 0 for c in chunks)])
+
         update_job_with_results(
             job_id=job_id,
             transcript=full_transcript,
             overview=overview,
             summary=summary,
             actions=actions,
-            duration=duration
+            duration=duration,
+            **({"billable_seconds": billing_seconds} if billing_seconds is not None else {})
         )
 
         notify_stage(job_id, "done", 100)
+        minutes.debit_job(job_id, job.get("user_id"), meeting_id, billing_seconds, provider)
         print(f"✅ Chunked job {job_id} completed successfully!")
         print(f"   - Chunks processed: {len(chunks)}")
         print(f"   - Total transcript: {len(full_transcript)} chars")
@@ -634,14 +653,32 @@ def process_chunked_job(job: Dict[str, Any]):
             print(f"   ⚠️  Failed to update job status: {update_error}")
 
 
+def measure_audio_seconds(audio_data: bytes) -> Optional[float]:
+    """ffprobe-measured duration of in-memory audio (None if ffprobe is missing or fails).
+
+    transcribe_audio's own duration is len(bytes)/32000, about 4x too low for 64 kbps AAC; billing
+    and the stored duration use the measured value whenever there is one."""
+    try:
+        with large_audio.temp_workdir() as workdir:
+            path = os.path.join(workdir, "probe.bin")
+            with open(path, "wb") as f:
+                f.write(audio_data)
+            return xai_single.probe_duration(path)
+    except Exception:
+        return None
+
+
 def transcribe_regular_job_audio(job_id: str, audio_url: str, language, provider: str, user_id: str = None):
-    """Existing regular path: download into memory, transcribe (chunked internally), return (text, duration)."""
+    """Existing regular path: download into memory, transcribe (chunked internally).
+
+    Returns (text, duration, measured): `measured` is True when `duration` came from ffprobe."""
     # Step 2: Download audio (0-10%)
     print(f"   📥 Downloading audio...")
     update_job_progress(job_id, 5, "Downloading audio...")
     notify_stage(job_id, "preparing", 5)
     audio_data = download_audio(audio_url, user_id)
     update_job_progress(job_id, 10, "Audio downloaded")
+    measured_seconds = measure_audio_seconds(audio_data)
 
     # Step 3: Transcribe using OpenAI Whisper (10-60%)
     print(f"   🎤 Transcribing audio...")
@@ -662,8 +699,7 @@ def transcribe_regular_job_audio(job_id: str, audio_url: str, language, provider
     )
 
     transcript = result["transcript"]
-    duration = result["duration"]
-    return transcript, duration
+    return transcript, (measured_seconds or result["duration"]), bool(measured_seconds)
 
 
 def transcribe_uploaded_job_audio(job_id: str, job: Dict[str, Any], language, provider: str):
@@ -673,7 +709,7 @@ def transcribe_uploaded_job_audio(job_id: str, job: Dict[str, Any], language, pr
     exact same `transcribe_audio` call as regular jobs; files above the threshold are cut
     with ffmpeg into ~5 minute segments and run through the per-chunk provider call plus
     the overlap merge (large_audio), so a 1-2 h file never gets decoded by pydub.
-    Returns (text, duration).
+    Returns (text, duration, measured): `measured` is True when `duration` came from ffprobe.
     """
     path = job["storage_path"]
     ext = path.rsplit(".", 1)[-1].lower() if "." in path.rsplit("/", 1)[-1] else "m4a"
@@ -692,10 +728,11 @@ def transcribe_uploaded_job_audio(job_id: str, job: Dict[str, Any], language, pr
 
         # Size alone is a poor proxy for memory use (a 14 MB low-bitrate file can be hours
         # of audio), so also use the client-reported duration, else ffprobe.
-        audio_seconds = job.get("duration") or (xai_single.probe_duration(source) if large_audio.segmenting_enabled() else None)
+        measured = xai_single.probe_duration(source)
+        audio_seconds = job.get("duration") or (measured if large_audio.segmenting_enabled() else None)
         if large_audio.should_segment(size, audio_seconds):
             print(f"   ✂️ Large file ({size / 1024 / 1024:.1f} MB, {audio_seconds}s): segmenting with ffmpeg")
-            return large_audio.transcribe_large_file(
+            text, duration = large_audio.transcribe_large_file(
                 source, workdir, language, provider,
                 progress=lambda pct, stage: (
                     update_job_progress(job_id, 10 + int(pct * 0.5), stage),
@@ -703,6 +740,7 @@ def transcribe_uploaded_job_audio(job_id: str, job: Dict[str, Any], language, pr
                 ),
                 duration_hint=audio_seconds, workers=MAX_CHUNK_WORKERS,
             )
+            return text, (measured or duration), bool(measured)
 
         with open(source, "rb") as f:
             audio_data = f.read()
@@ -714,7 +752,7 @@ def transcribe_uploaded_job_audio(job_id: str, job: Dict[str, Any], language, pr
             ),
             language=language, provider=provider,
         )
-        return result["transcript"], result["duration"]
+        return result["transcript"], (measured or result["duration"]), bool(measured)
 
 
 def process_job(job: Dict[str, Any]):
@@ -752,6 +790,7 @@ def process_job(job: Dict[str, Any]):
         # Steps 2-3: transcript. xAI jobs try ONE request for the whole audio first
         # and fall back to the existing download + chunked path when it declines.
         single = None
+        measured = False
         if xai_single.should_use_single_request(provider):
             single = xai_single.run_single_request(
                 [(lambda dest: download_storage_object_to_file(storage_path, dest)) if storage_path
@@ -765,10 +804,11 @@ def process_job(job: Dict[str, Any]):
         if single is not None:
             transcript = single.text
             duration = single.duration
+            measured = True  # ffprobe on the prepared audio
         elif storage_path:
-            transcript, duration = transcribe_uploaded_job_audio(job_id, job, language, provider)
+            transcript, duration, measured = transcribe_uploaded_job_audio(job_id, job, language, provider)
         else:
-            transcript, duration = transcribe_regular_job_audio(job_id, audio_url, language, provider, job.get("user_id"))
+            transcript, duration, measured = transcribe_regular_job_audio(job_id, audio_url, language, provider, job.get("user_id"))
 
         print(f"   ✅ Transcription complete: {len(transcript)} chars, {duration:.1f}s")
 
@@ -797,17 +837,27 @@ def process_job(job: Dict[str, Any]):
         print(f"   💾 Saving all results to database...")
         update_job_progress(job_id, 95, "Saving results...")
 
+        # Billing length (only used with SERVER_MINUTES_DEBIT_ENABLED): the ffprobe-measured duration;
+        # if ffprobe was unavailable, the app-reported duration, then the byte-size estimate.
+        billing_seconds = None
+        if minutes.debit_enabled():
+            billing_seconds = minutes.choose_billing_seconds(duration if measured else None, [job.get("duration"), duration])
+            if not measured:
+                print(f"   ⚠️ Billing on an UNMEASURED duration ({billing_seconds}s): is ffprobe installed?")
+
         update_job_with_results(
             job_id=job_id,
             transcript=transcript,
             overview=overview,
             summary=summary,
             actions=actions,
-            duration=duration
+            duration=duration,
+            **({"billable_seconds": billing_seconds} if billing_seconds is not None else {})
         )
         # update_job_with_results automatically sets progress to 100% and stage to "Complete"
 
         notify_stage(job_id, "done", 100)
+        minutes.debit_job(job_id, job.get("user_id"), job.get("meeting_id"), billing_seconds, provider)
         print(f"✅ Job {job_id} completed successfully!")
         print(f"   - Transcript: {len(transcript)} chars")
         print(f"   - Overview: {overview[:80]}...")
@@ -869,6 +919,12 @@ async def process_pending_jobs(max_concurrent: int = 3):
         await asyncio.get_running_loop().run_in_executor(None, background_upload.promote_uploaded_jobs)
     except Exception as e:
         print(f"⚠️ promote_uploaded_jobs failed: {type(e).__name__}: {e}")
+
+    # Retry minutes debits that failed earlier (no-op unless SERVER_MINUTES_DEBIT_ENABLED; throttled; never raises).
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, minutes.sweep_undebited)
+    except Exception as e:
+        print(f"⚠️ minutes sweep failed: {type(e).__name__}: {e}")
 
     pending_jobs = get_pending_jobs()
 
