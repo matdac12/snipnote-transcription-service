@@ -375,7 +375,7 @@ def download_chunk_from_storage(chunk_file_path: str) -> bytes:
         raise
 
 
-def process_single_chunk(chunk: Dict[str, Any], total_chunks: int, language: str = None) -> Dict[str, Any]:
+def process_single_chunk(chunk: Dict[str, Any], total_chunks: int, language: str = None, provider: str = "openai") -> Dict[str, Any]:
     """
     Process a single audio chunk: download and transcribe.
     Used by ThreadPoolExecutor for parallel processing.
@@ -398,7 +398,7 @@ def process_single_chunk(chunk: Dict[str, Any], total_chunks: int, language: str
 
         # Transcribe chunk
         print(f"   🎤 Transcribing chunk {chunk_index + 1}/{total_chunks}...")
-        result = transcribe_audio(chunk_data, f"chunk_{chunk_index}.m4a", language=language)
+        result = transcribe_audio(chunk_data, f"chunk_{chunk_index}.m4a", language=language, provider=provider)
         transcript = result["transcript"]
 
         print(f"   ✅ Chunk {chunk_index + 1}/{total_chunks} transcribed ({len(transcript)} chars)")
@@ -424,6 +424,7 @@ def process_chunked_job(job: Dict[str, Any]):
     meeting_id = job["meeting_id"]
     total_chunks = job.get("total_chunks", 0)
     language = job.get("language")  # None if not specified (auto-detect)
+    provider = job.get("transcription_provider", "openai")
 
     try:
         # Step 1: Update status to 'processing'
@@ -454,7 +455,7 @@ def process_chunked_job(job: Dict[str, Any]):
         with ThreadPoolExecutor(max_workers=MAX_CHUNK_WORKERS) as executor:
             # Submit all chunks for parallel processing
             future_to_chunk = {
-                executor.submit(process_single_chunk, chunk, len(chunks), language): chunk
+                executor.submit(process_single_chunk, chunk, len(chunks), language, provider): chunk
                 for chunk in chunks
             }
 
@@ -590,6 +591,7 @@ def process_job(job: Dict[str, Any]):
     # Regular (non-chunked) job processing
     audio_url = job["audio_url"]
     language = job.get("language")  # None if not specified (auto-detect)
+    provider = job.get("transcription_provider", "openai")
 
     try:
         # Step 1: Update status to 'processing' and set initial progress
@@ -615,7 +617,8 @@ def process_job(job: Dict[str, Any]):
             audio_data,
             "audio.m4a",
             progress_callback=transcription_progress,
-            language=language
+            language=language,
+            provider=provider
         )
 
         transcript = result["transcript"]

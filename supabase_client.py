@@ -25,7 +25,8 @@ def create_job(
     is_chunked: bool = False,
     total_chunks: int = 1,
     duration: float | None = None,
-    language: str | None = None
+    language: str | None = None,
+    transcription_provider: str = "openai"
 ) -> Dict[str, Any]:
     """
     Create a new transcription job with status='pending'
@@ -45,6 +46,8 @@ def create_job(
     Raises:
         Exception: If job creation fails
     """
+    from transcription_provider import validate_transcription_provider
+    validate_transcription_provider(transcription_provider)
     try:
         data = {
             "user_id": user_id,
@@ -52,7 +55,8 @@ def create_job(
             "status": "pending",
             "is_chunked": is_chunked,
             "total_chunks": total_chunks,
-            "chunks_processed": 0
+            "chunks_processed": 0,
+            "transcription_provider": transcription_provider
         }
 
         # Only add audio_url if provided (not required for chunked jobs)
