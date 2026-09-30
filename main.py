@@ -1,12 +1,16 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends, Form, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 from typing import Literal
 import uvicorn
 import os
 import warnings
 from transcribe import transcribe_audio
 from supabase_client import create_job, get_job
+import auth
+import background_upload
 
 # Suppress pydub regex warnings in Python 3.13+
 warnings.filterwarnings("ignore", category=SyntaxWarning, module="pydub")
@@ -38,20 +42,44 @@ async def verify_api_key(x_api_key: str = Header(None)):
 
 # Request/Response Models
 class CreateJobRequest(BaseModel):
-    user_id: str
+    # Legacy mode requires user_id in the body. upload_pending mode IGNORES it for
+    # authorization: the user is taken from the verified Supabase JWT.
+    user_id: str | None = None
     meeting_id: str
     audio_url: str | None = None  # Optional for chunked jobs
     is_chunked: bool = False
     total_chunks: int = 1
     duration: float | None = None
-    transcription_provider: Literal["openai", "xai"] = "openai"
+    # `provider` is accepted as an alias (used by the upload_pending contract)
+    transcription_provider: Literal["openai", "xai"] = Field(
+        "openai", validation_alias=AliasChoices("transcription_provider", "provider"))
     language: str | None = None  # ISO-639-1 code (e.g., "en", "it"). None for auto-detect
+    # --- background upload mode ---
+    upload_pending: bool = False
+    expected_bytes: int | None = None
+    file_extension: str | None = None  # e.g. "m4a" (default), "mp3", "wav"
+    content_type: str | None = None    # default derived from the extension
+
+    @model_validator(mode="after")
+    def _legacy_requires_user_id(self):
+        if not self.upload_pending and not self.user_id:
+            raise ValueError("user_id is required")
+        return self
 
 
 class CreateJobResponse(BaseModel):
     job_id: str
     status: str
     created_at: str
+    # Only present (non-null) in upload_pending mode; legacy responses are unchanged
+    # because the endpoint uses response_model_exclude_none.
+    upload_url: str | None = None
+    upload_method: str | None = None
+    upload_headers: dict[str, str] | None = None
+    expires_at: str | None = None
+    upload_deadline: str | None = None
+    storage_path: str | None = None
+    expected_bytes: int | None = None
 
 
 class JobStatusResponse(BaseModel):
@@ -73,6 +101,9 @@ class JobStatusResponse(BaseModel):
     created_at: str
     updated_at: str
     completed_at: str | None = None
+    # Background upload jobs (null otherwise)
+    expected_bytes: int | None = None
+    upload_deadline: str | None = None
 
 # Allow all origins for testing (will restrict later)
 app.add_middleware(
@@ -82,15 +113,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.exception_handler(auth.AuthError)
+async def auth_error_handler(request: Request, exc: auth.AuthError):
+    headers = {"WWW-Authenticate": "Bearer"} if exc.status_code == 401 else None
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=headers)
+
+
 @app.get("/")
 async def health_check():
     return {"status": "healthy", "service": "snipnote-transcription"}
 
 
-@app.post("/jobs", response_model=CreateJobResponse)
+@app.post("/jobs", response_model=CreateJobResponse, response_model_exclude_none=True)
 async def create_transcription_job(
     request: CreateJobRequest,
-    authenticated: bool = Depends(verify_api_key)
+    authenticated: bool = Depends(verify_api_key),
+    authorization: str | None = Header(None),
 ):
     """
     Create a new transcription job (regular or chunked)
@@ -102,7 +140,13 @@ async def create_transcription_job(
     - Provide total_chunks and duration
     - Audio chunks should be pre-uploaded to audio_chunks table
     - Worker will fetch chunks from database using meeting_id
+
+    Background upload (upload_pending=true): requires `Authorization: Bearer <Supabase
+    user JWT>`; see docs/BACKGROUND_UPLOAD_CONTRACT.md. Creates an `awaiting_upload` job
+    and returns a signed upload URL; the worker starts the job once the file lands.
     """
+    if request.upload_pending:
+        return await create_upload_pending_job(request, authorization)
     try:
         # Create job in Supabase
         job = create_job(
@@ -123,6 +167,34 @@ async def create_transcription_job(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create job: {str(e)}")
+
+
+async def create_upload_pending_job(request: CreateJobRequest, authorization: str | None):
+    # JWT verification may fetch a JWKS and every step below is blocking I/O: keep it
+    # off the event loop.
+    user = await run_in_threadpool(auth.authenticate_header, authorization)
+    if request.user_id and request.user_id.lower() != user.user_id:
+        raise HTTPException(status_code=403, detail="user_id does not match the authenticated user")
+    try:
+        result = await run_in_threadpool(
+            lambda: background_upload.create_upload_job(
+                user_id=user.user_id,  # from the verified token, never from the body
+                meeting_id=request.meeting_id,
+                expected_bytes=request.expected_bytes,
+                file_extension=request.file_extension,
+                content_type=request.content_type,
+                duration=request.duration,
+                language=request.language,
+                provider=request.transcription_provider,
+            )
+        )
+    except background_upload.UploadRequestError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail)
+    except Exception as error:
+        # Generic body: error text could contain storage/DB internals.
+        print(f"❌ upload_pending job creation failed: {type(error).__name__}")
+        raise HTTPException(status_code=500, detail="Failed to create upload job")
+    return CreateJobResponse(**result)
 
 
 @app.get("/jobs/{job_id}", response_model=JobStatusResponse)

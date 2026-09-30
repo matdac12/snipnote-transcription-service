@@ -297,9 +297,58 @@ ${XAI_WORK_DIR:-/tmp}/snipnote-xai-*` is empty afterwards and peak RSS
 (`systemd-cgtop`) stays well under 1500M. Roll back instantly with
 `XAI_SINGLE_REQUEST_ENABLED=false` + worker restart.
 
+### Background upload (`upload_pending`)
+
+Server side of "hand one original file to a background URLSession". Full app-facing
+contract: [`docs/BACKGROUND_UPLOAD_CONTRACT.md`](docs/BACKGROUND_UPLOAD_CONTRACT.md).
+
+How it works: `POST /jobs` with `upload_pending=true` (Supabase user JWT required)
+creates a job with status `awaiting_upload` and returns a Supabase Storage signed upload
+URL for `recordings/<user_id>/<meeting_id>.<ext>`. Each worker loop first runs
+`promote_uploaded_jobs()`: an `awaiting_upload` job whose object exists with exactly
+`expected_bytes` becomes `pending` (compare-and-set on status); jobs older than their
+`upload_deadline` (`UPLOAD_PENDING_TTL_SECONDS`, 6 h) become `failed` / `upload_expired`
+and the partial object is deleted. The existing `pending` flow then runs; the worker
+streams the file from storage to disk. Files above `LARGE_FILE_THRESHOLD_BYTES` (15 MiB)
+or `LARGE_FILE_THRESHOLD_SECONDS` (30 min) are split by ffmpeg into ~5 min segments
+and transcribed per segment with the existing overlap merge (both providers; xAI still
+tries its single request first). The legacy `upload_pending=false` path is untouched
+(no JWT requirement added there).
+
+Release order (additive, nothing breaks if the app is not yet updated):
+
+1. **Migrations, in this order, as two separate runs**: `migrations/006_add_awaiting_upload_status.sql`
+   (adds the enum value / extends the CHECK), wait until it has committed, then
+   `migrations/007_background_upload_columns.sql` (columns, unique and promotion
+   indexes). They must not share one transaction (`ALTER TYPE ... ADD VALUE` limit, see
+   the comments in 006). Both are idempotent. Apply them BEFORE the new worker: a worker
+   that queries `status = 'awaiting_upload'` on an enum without the value logs an error
+   every loop (it is caught, other jobs keep running).
+2. Set `SUPABASE_JWT_SECRET` (HS256 projects) and/or `SUPABASE_JWT_USE_JWKS=true`
+   (projects using asymmetric signing keys) in `/etc/snipnote-transcription/env`. Check
+   which one your project uses in Dashboard -> Project Settings -> JWT Keys. Without
+   either, the new mode returns 503 and the legacy path keeps working.
+3. In the Supabase dashboard raise the Storage **global file size limit** (Storage ->
+   Settings) and, if set, the `recordings` bucket limit to at least ~150 MB
+   (`MAX_UPLOAD_BYTES` default is 300 MiB). Otherwise large PUTs fail and jobs expire.
+4. Deploy API + worker (`git pull`, `pip install -r requirements.txt` for PyJWT, restart
+   both units).
+5. Smoke test with a real user token: POST `/jobs` (upload_pending), `curl -X PUT
+   --data-binary @file -H 'Content-Type: audio/m4a' -H 'x-upsert: true' "<upload_url>"`,
+   watch `journalctl -u snipnote-worker -f` for `promoted to pending`, then the job
+   status. Also test an oversize/wrong-size file and an expired job (set a short
+   `UPLOAD_PENDING_TTL_SECONDS` on staging).
+
+Operating notes: the worker loop is single-threaded, so while a long job runs, uploads
+that finished in the meantime are promoted only after it (status reads `awaiting_upload`
+a little longer; processing order is unchanged because jobs queue anyway). Signed URLs
+are credentials: they are never logged by this service, but keep them out of any proxy or
+app logs you add. Scratch space for big files is `XAI_WORK_DIR` (real disk, about 2x the
+file size; stale dirs are swept after 6 h).
+
 Offline verification (no production credentials):
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q main.py ai_config.py transcription_provider.py transcribe.py jobs.py supabase_client.py xai_single.py
+python -m compileall -q main.py ai_config.py transcription_provider.py transcribe.py jobs.py supabase_client.py xai_single.py auth.py background_upload.py large_audio.py
 ```

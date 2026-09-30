@@ -16,11 +16,14 @@ from supabase_client import (
     get_audio_chunks,
     update_chunk_transcript,
     update_chunks_processed,
-    increment_retry_count
+    increment_retry_count,
+    download_storage_object_to_file,
 )
 from transcribe import transcribe_audio
 from ai_config import create_response
 import xai_single
+import large_audio
+import background_upload
 
 
 # Maximum retry attempts before permanent failure
@@ -640,6 +643,49 @@ def transcribe_regular_job_audio(job_id: str, audio_url: str, language, provider
     return transcript, duration
 
 
+def transcribe_uploaded_job_audio(job_id: str, job: Dict[str, Any], language, provider: str):
+    """Background-upload jobs: the original file sits in Supabase Storage (`storage_path`).
+
+    The download is streamed to disk (never held in RAM). Small files then go through the
+    exact same `transcribe_audio` call as regular jobs; files above the threshold are cut
+    with ffmpeg into ~5 minute segments and run through the per-chunk provider call plus
+    the overlap merge (large_audio), so a 1-2 h file never gets decoded by pydub.
+    Returns (text, duration).
+    """
+    path = job["storage_path"]
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path.rsplit("/", 1)[-1] else "m4a"
+    with large_audio.temp_workdir() as workdir:
+        print(f"   📥 Downloading uploaded audio...")
+        update_job_progress(job_id, 5, "Downloading audio...")
+        source = os.path.join(workdir, f"source.{ext}")
+        download_storage_object_to_file(path, source)
+        size = os.path.getsize(source)
+        expected = job.get("expected_bytes")
+        if isinstance(expected, int) and expected > 0 and size != expected:
+            raise Exception(f"Downloaded audio size {size} does not match expected {expected} bytes (network error)")
+        update_job_progress(job_id, 10, "Audio downloaded")
+
+        # Size alone is a poor proxy for memory use (a 14 MB low-bitrate file can be hours
+        # of audio), so also use the client-reported duration, else ffprobe.
+        audio_seconds = job.get("duration") or (xai_single.probe_duration(source) if large_audio.segmenting_enabled() else None)
+        if large_audio.should_segment(size, audio_seconds):
+            print(f"   ✂️ Large file ({size / 1024 / 1024:.1f} MB, {audio_seconds}s): segmenting with ffmpeg")
+            return large_audio.transcribe_large_file(
+                source, workdir, language, provider,
+                progress=lambda pct, stage: update_job_progress(job_id, 10 + int(pct * 0.5), stage),
+                duration_hint=audio_seconds, workers=MAX_CHUNK_WORKERS,
+            )
+
+        with open(source, "rb") as f:
+            audio_data = f.read()
+        result = transcribe_audio(
+            audio_data, f"audio.{ext}",
+            progress_callback=lambda pct, stage: update_job_progress(job_id, 10 + int(pct * 0.5), stage),
+            language=language, provider=provider,
+        )
+        return result["transcript"], result["duration"]
+
+
 def process_job(job: Dict[str, Any]):
     """
     Process a single transcription job with full AI pipeline and progress tracking
@@ -658,8 +704,10 @@ def process_job(job: Dict[str, Any]):
         process_chunked_job(job)
         return
 
-    # Regular (non-chunked) job processing
-    audio_url = job["audio_url"]
+    # Regular (non-chunked) job processing. Background-upload jobs have no audio_url:
+    # their original file is in storage at `storage_path`.
+    audio_url = job.get("audio_url")
+    storage_path = job.get("storage_path")
     language = job.get("language")  # None if not specified (auto-detect)
     provider = job.get("transcription_provider", "openai")
 
@@ -674,13 +722,16 @@ def process_job(job: Dict[str, Any]):
         single = None
         if xai_single.should_use_single_request(provider):
             single = xai_single.run_single_request(
-                [lambda dest: download_audio_to_file(audio_url, dest)],
+                [(lambda dest: download_storage_object_to_file(storage_path, dest)) if storage_path
+                 else (lambda dest: download_audio_to_file(audio_url, dest))],
                 language,
                 progress=lambda pct, stage: update_job_progress(job_id, 5 + int(pct * 0.55), stage),
             )
         if single is not None:
             transcript = single.text
             duration = single.duration
+        elif storage_path:
+            transcript, duration = transcribe_uploaded_job_audio(job_id, job, language, provider)
         else:
             transcript, duration = transcribe_regular_job_audio(job_id, audio_url, language, provider)
 
@@ -772,6 +823,14 @@ async def process_pending_jobs(max_concurrent: int = 3):
 
     Jobs are processed in parallel up to max_concurrent limit for better performance.
     """
+    # Flip finished background uploads to 'pending' (and expire abandoned ones) first,
+    # so they are picked up by the query below in this same loop. Runs in a thread:
+    # it makes blocking HTTP calls, and it never raises.
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, background_upload.promote_uploaded_jobs)
+    except Exception as e:
+        print(f"⚠️ promote_uploaded_jobs failed: {type(e).__name__}: {e}")
+
     pending_jobs = get_pending_jobs()
 
     if not pending_jobs:

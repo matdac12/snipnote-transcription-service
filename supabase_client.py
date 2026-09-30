@@ -395,3 +395,193 @@ def increment_retry_count(job_id: str, error_message: str) -> Dict[str, Any]:
     except Exception as e:
         print(f"❌ Error incrementing retry count for job {job_id}: {e}")
         raise
+
+
+# ---------------------------------------------------------------------------
+# Background upload support (upload_pending jobs)
+#
+# Storage REST calls go straight to {SUPABASE_URL}/storage/v1 with the service key.
+# Signed upload URLs carry a bearer-style token in their query string: NEVER log
+# them or anything derived from them (see create_signed_upload_url).
+# ---------------------------------------------------------------------------
+import base64
+import json as _json
+import time as _time
+import urllib.parse as _urlparse
+
+import httpx
+
+RECORDINGS_BUCKET = os.getenv("RECORDINGS_BUCKET", "recordings")
+STORAGE_BASE_URL = f"{SUPABASE_URL.rstrip('/')}/storage/v1"
+# Supabase Storage signs upload URLs for a fixed 2 hours (server-side setting);
+# used only when the token's own `exp` cannot be read.
+DEFAULT_SIGNED_UPLOAD_SECONDS = 7200
+
+AWAITING_UPLOAD = "awaiting_upload"
+
+storage_http = httpx.Client(timeout=httpx.Timeout(15.0, connect=10.0))
+
+
+class StorageError(RuntimeError):
+    """Sanitized storage failure (never includes URLs, tokens or response bodies)."""
+
+
+def _storage_headers(**extra: str) -> Dict[str, str]:
+    return {"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "apikey": SUPABASE_SERVICE_KEY, **extra}
+
+
+def _quote_path(path: str) -> str:
+    return "/".join(_urlparse.quote(part, safe="") for part in path.split("/"))
+
+
+def _token_expiry(token: str) -> Optional[float]:
+    """`exp` of the (storage-signed) upload token, read WITHOUT verifying it."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = _json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+        return float(exp) if isinstance(exp, (int, float)) else None
+    except Exception:
+        return None
+
+
+def create_signed_upload_url(path: str, upsert: bool = True) -> Dict[str, Any]:
+    """Mint a Supabase Storage signed upload URL for `path` in the recordings bucket.
+
+    POST /storage/v1/object/upload/sign/<bucket>/<path> with the service key; the
+    response is {"url": "/object/upload/sign/<bucket>/<path>?token=<jwt>"}. With
+    `x-upsert: true` the token allows replacing an existing object (a retried upload).
+
+    Returns {"upload_url": str, "expires_at": epoch seconds}. Raises StorageError.
+    """
+    headers = _storage_headers(**{"x-upsert": "true"} if upsert else {})
+    try:
+        response = storage_http.post(
+            f"{STORAGE_BASE_URL}/object/upload/sign/{RECORDINGS_BUCKET}/{_quote_path(path)}",
+            headers=headers,
+        )
+    except httpx.HTTPError as error:
+        raise StorageError(f"signed upload URL request failed ({type(error).__name__})") from None
+    if response.status_code >= 300:
+        raise StorageError(f"signed upload URL request returned HTTP {response.status_code}")
+    try:
+        relative = response.json()["url"]
+        token = _urlparse.parse_qs(_urlparse.urlparse(relative).query)["token"][0]
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise StorageError("signed upload URL response was malformed") from None
+    upload_url = relative if relative.startswith("http") else f"{STORAGE_BASE_URL}/{relative.lstrip('/')}"
+    expires_at = _token_expiry(token) or (_time.time() + DEFAULT_SIGNED_UPLOAD_SECONDS)
+    return {"upload_url": upload_url, "expires_at": expires_at}
+
+
+def get_storage_object_size(path: str) -> Optional[int]:
+    """Size in bytes of a finished object, or None if it is absent or not finished.
+
+    Uses POST /storage/v1/object/list/<bucket> (prefix + exact-name match); the
+    per-object `metadata.size` is only populated once the upload has completed, which
+    is what makes an exact size comparison a reliable "upload finished" signal.
+    Raises StorageError when storage itself cannot be queried.
+    """
+    directory, _, name = path.rpartition("/")
+    try:
+        response = storage_http.post(
+            f"{STORAGE_BASE_URL}/object/list/{RECORDINGS_BUCKET}",
+            headers=_storage_headers(),
+            json={"prefix": directory, "search": name, "limit": 100, "offset": 0},
+        )
+    except httpx.HTTPError as error:
+        raise StorageError(f"storage list failed ({type(error).__name__})") from None
+    if response.status_code >= 300:
+        raise StorageError(f"storage list returned HTTP {response.status_code}")
+    try:
+        entries = response.json()
+    except ValueError:
+        raise StorageError("storage list response was malformed") from None
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, dict) and entry.get("name") == name:
+            size = (entry.get("metadata") or {}).get("size")
+            return int(size) if isinstance(size, (int, float)) and not isinstance(size, bool) else None
+    return None
+
+
+def delete_storage_object(path: str) -> None:
+    """Best-effort removal of an object (used for expired, never-promoted uploads)."""
+    try:
+        supabase.storage.from_(RECORDINGS_BUCKET).remove([path])
+    except Exception as error:
+        print(f"   ⚠️ Could not delete storage object for expired upload ({type(error).__name__})")
+
+
+def download_storage_object_to_file(path: str, dest_path: str) -> None:
+    """Stream a private/public bucket object to disk using the service key (constant memory)."""
+    url = f"{STORAGE_BASE_URL}/object/authenticated/{RECORDINGS_BUCKET}/{_quote_path(path)}"
+    try:
+        with storage_http.stream("GET", url, headers=_storage_headers(), timeout=httpx.Timeout(600.0, connect=15.0)) as response:
+            if response.status_code >= 300:
+                raise StorageError(f"storage download returned HTTP {response.status_code}")
+            with open(dest_path, "wb") as out:
+                for block in response.iter_bytes(1024 * 1024):
+                    out.write(block)
+    except httpx.HTTPError as error:
+        raise StorageError(f"storage download failed ({type(error).__name__})") from None
+
+
+def _rows(response) -> list:
+    return response.data or []
+
+
+def find_upload_job(user_id: str, meeting_id: str) -> Optional[Dict[str, Any]]:
+    """Newest non-failed upload-mode job of this meeting (idempotency lookup)."""
+    response = (
+        supabase.table("transcription_jobs").select("*")
+        .eq("user_id", user_id).eq("meeting_id", meeting_id)
+        .not_.is_("storage_path", "null").neq("status", "failed")
+        .order("created_at", desc=True).limit(1).execute()
+    )
+    rows = _rows(response)
+    return rows[0] if rows else None
+
+
+def is_unique_violation(error: Exception) -> bool:
+    text = f"{getattr(error, 'code', '')} {error}".lower()
+    return "23505" in text or "duplicate key" in text or "unique constraint" in text
+
+
+def insert_upload_job(data: Dict[str, Any]) -> Dict[str, Any]:
+    response = supabase.table("transcription_jobs").insert(data).execute()
+    rows = _rows(response)
+    if not rows:
+        raise Exception("Failed to create job: No data returned")
+    return rows[0]
+
+
+def transition_job_status(job_id: str, from_status: str, to_status: str, **fields: Any) -> Optional[Dict[str, Any]]:
+    """Atomic compare-and-set: UPDATE ... WHERE id=? AND status=<from_status>.
+
+    Returns the updated row, or None when another worker/loop/request already moved
+    the job (nothing is written in that case).
+    """
+    response = (
+        supabase.table("transcription_jobs").update({"status": to_status, **fields})
+        .eq("id", job_id).eq("status", from_status).execute()
+    )
+    rows = _rows(response)
+    return rows[0] if rows else None
+
+
+def update_awaiting_job(job_id: str, **fields: Any) -> Optional[Dict[str, Any]]:
+    """Update columns of a job only while it is still awaiting_upload (CAS on status)."""
+    response = (
+        supabase.table("transcription_jobs").update(fields)
+        .eq("id", job_id).eq("status", AWAITING_UPLOAD).execute()
+    )
+    rows = _rows(response)
+    return rows[0] if rows else None
+
+
+def list_awaiting_upload_jobs(limit: int = 200) -> list:
+    response = (
+        supabase.table("transcription_jobs").select("*")
+        .eq("status", AWAITING_UPLOAD).order("created_at").limit(limit).execute()
+    )
+    return _rows(response)

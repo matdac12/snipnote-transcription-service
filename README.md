@@ -80,6 +80,17 @@ The `render.yaml` file automatically configures both the web service and cron wo
   - Headers: `X-API-Key: <your-api-key>` (optional if API_KEY not set)
   - Returns: Full job details including transcript if completed
 
+### Background upload mode
+- `POST /jobs` with `{"upload_pending": true, "meeting_id": "...", "expected_bytes": N, ...}` and
+  `Authorization: Bearer <Supabase user JWT>` creates a job in the new status
+  `awaiting_upload` and returns a Supabase Storage signed upload URL (`upload_url`).
+  The app PUTs the original file there from a background URLSession; the worker promotes
+  the job to `pending` once the object exists with the expected size (and expires it after
+  `UPLOAD_PENDING_TTL_SECONDS`). Idempotent per `meeting_id`. Contract for the iOS side:
+  [docs/BACKGROUND_UPLOAD_CONTRACT.md](docs/BACKGROUND_UPLOAD_CONTRACT.md); deployment:
+  [DEPLOYMENT.md](DEPLOYMENT.md#background-upload-upload_pending). The user comes from the
+  verified JWT (`auth.py`), never from the body. Legacy requests (no `upload_pending`) behave as before.
+
 ### Legacy Sync Endpoint
 - `POST /transcribe` - Upload audio file for synchronous transcription
   - Accepts: multipart/form-data with `file` field
