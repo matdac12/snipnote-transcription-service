@@ -89,3 +89,9 @@ class JobTests(unittest.TestCase):
             self.assertEqual(transcribe.call_args.kwargs.get('provider'), 'xai')
             response = self.api.post('/transcribe', files={'file': ('meeting.m4a', b'audio')}, data={'transcription_provider': 'unknown'})
             self.assertEqual(response.status_code, 422)
+
+    def test_synchronous_empty_provider_is_rejected(self):
+        with patch.object(main, 'transcribe_audio') as transcribe:
+            response = self.api.post('/transcribe', files={'file': ('meeting.m4a', b'audio')}, data={'transcription_provider': ''})
+            self.assertEqual(response.status_code, 422)
+            transcribe.assert_not_called()

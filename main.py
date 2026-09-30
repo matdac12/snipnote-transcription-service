@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Literal
@@ -150,10 +150,16 @@ async def get_job_status(
 
 @app.post("/transcribe")
 async def transcribe(
+    request: Request,
     file: UploadFile = File(...),
     language: str | None = Form(None),  # Optional ISO-639-1 code
     transcription_provider: Literal["openai", "xai"] = Form("openai")
 ):
+    # FastAPI replaces empty form values with defaults; distinguish an explicit
+    # invalid value from an omitted field before it can reach a provider.
+    form = await request.form()
+    if "transcription_provider" in form and form["transcription_provider"] not in ("openai", "xai"):
+        raise HTTPException(status_code=422, detail="Invalid transcription provider")
     try:
         # Read audio file
         audio_data = await file.read()
