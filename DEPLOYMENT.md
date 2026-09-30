@@ -220,3 +220,49 @@ This ensures the overview, summary, and actions are generated in the same langua
 4. Monitor `journalctl -u snipnote-worker -f` for successful AI processing
 
 All done! 🎉
+
+## Saved transcription provider release
+
+This release is prepared locally; deployment, credentials, restarts and paid
+smoke tests require separate authorization. Local main includes four unpushed
+configuration commits ending at `5176d6b`; deploy these together with the feature.
+
+1. Inspect Supabase schema/history and apply only the app's additive migration
+   `20260930105323_add_transcription_provider.sql`. Do not replay historical
+   migrations with blanket `supabase db push`.
+2. Set `XAI_API_KEY` in Supabase Edge Function secrets and separately in the
+   VPS `/etc/snipnote-transcription/env` (root-owned, mode 600). Add it on the
+   VPS now, before deploying provider-capable API/worker code; Supabase's secret
+   alone does not configure the VPS. Preserve OpenAI credentials for text tasks.
+3. Deploy the reviewed proxy with JWT verification, then this service API and
+   worker. Restart **both** `snipnote-api.service` and `snipnote-worker.service`
+   in the approved window. Verify health and sanitized logs without printing keys.
+4. Run staging smoke tests, then release iOS last.
+
+`POST /jobs` accepts `transcription_provider: openai|xai` for regular and chunked
+jobs; the DB stores the value and GET status returns it. `/transcribe` accepts
+that same multipart field. Missing fields/legacy jobs default to OpenAI; explicit
+unknown values return 422. Workers retain the stored choice across parallel
+chunks, internal chunking and retries; no provider failure changes provider.
+Model rows `transcription`/`transcription_xai` use the existing 60-second cache.
+Text generation, audio processing, minutes and notifications are unchanged.
+
+Before authorized staging release, test both providers on short proxy audio and
+long regular/chunked jobs, each with English, Italian and auto language. Change
+Settings during delayed upload and after a transient failure: all attempts must
+retain the captured/stored provider and the next operation must use the new
+choice. Check transcript quality, progress, summaries/actions, notifications and
+minutes. Simulate missing xAI key and 401/403/429/5xx on staging only; confirm no
+OpenAI fallback and no secrets/content in logs. These paid tests were not run.
+
+Rollback app and backends together; keep the additive DB column/config row.
+Stop new xAI submissions and drain or explicitly fail pending xAI jobs before
+rolling workers back to versions that ignore provider, or they could transcribe
+those jobs using OpenAI. Keep xAI credentials until queued jobs are handled.
+
+Offline verification (no production credentials):
+
+```bash
+python -m unittest discover -s tests -v
+python -m compileall -q main.py ai_config.py transcription_provider.py transcribe.py jobs.py supabase_client.py
+```

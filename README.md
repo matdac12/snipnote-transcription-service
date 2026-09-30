@@ -104,3 +104,20 @@ curl -X POST https://api.snipnote.app/jobs \
 curl -X GET https://api.snipnote.app/jobs/{job_id} \
   -H "X-API-Key: your-api-key"
 ```
+
+## Cloud transcription providers
+
+New jobs can choose `transcription_provider: "openai"` or `"xai"`; omitted
+selection defaults to OpenAI. Regular and chunked workers retain it for the whole
+job, including retries, and never switch providers on failure. The synchronous
+`/transcribe` route accepts the same field as multipart form data. Unknown values
+return 422. Status responses include the stored provider.
+
+Models resolve from Supabase `ai_model_config` rows `transcription` and
+`transcription_xai` (60-second cache). Only transcription changes; summary,
+overview and actions keep their current configuration. xAI uses `XAI_API_KEY`
+from the VPS environment; Supabase Edge Function secrets are configured
+separately. Never store credentials in model rows or iOS. Follow the additive
+migration, credentials, backend, then iOS order in
+[DEPLOYMENT.md](DEPLOYMENT.md#saved-transcription-provider-release). Paid staging
+smoke tests and deployment remain separate from offline implementation tests.

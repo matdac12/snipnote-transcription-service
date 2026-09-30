@@ -1,7 +1,8 @@
 # AI Model Configuration (`ai_model_config`)
 
 Server-side processing for meetings longer than 5 minutes no longer hardcodes models:
-- Transcription (`transcribe.py`) goes through `ai_config.create_transcription()`.
+- Transcription (`transcribe.py`) goes through `transcription_provider.create_provider_transcription()`.
+  OpenAI retains `ai_config.create_transcription()`; xAI uses its REST adapter.
 - Summaries (`generate_overview`, `generate_summary`, `extract_actions` in `jobs.py`)
   go through `ai_config.create_response()`.
 
@@ -13,11 +14,11 @@ switches the model for both short (on-device) and long (VPS) meetings.
 
 | Column | Meaning |
 |---|---|
-| `task` | `transcription`, `overview`, `summary`, `actions` (used here); iOS also uses `title`, `text_summary`, `eve_chat`, `actions_report` |
-| `model` | OpenAI model ID, e.g. `gpt-6-luna` |
+| `task` | `transcription`, `transcription_xai`, `overview`, `summary`, `actions` (used here); iOS also uses `title`, `text_summary`, `eve_chat`, `actions_report` |
+| `model` | Provider-specific model ID, e.g. `gpt-6-luna` |
 | `reasoning_effort` | e.g. `none`, `low`, `medium`, `high`. NULL sends no `reasoning` parameter (for models without reasoning). Note: `minimal` is rejected by GPT-6 models. |
 | `verbosity` | `low`, `medium` or `high`. NULL uses the code default (`low` for overview and summary, unset for actions). |
-| `fallback_model` | Retried once if OpenAI returns 400/404 for `model`. NULL disables the retry. |
+| `fallback_model` | Retried once within the selected provider for 400/404 on `model`. NULL disables the retry. |
 
 - The table is created by the migration `supabase/migrations/20260926_create_ai_model_config.sql`
   in the **SnipNote** repo.
@@ -86,3 +87,23 @@ systemctl status snipnote-api snipnote-worker --no-pager
 - **The code is the problem:** `git checkout <previous commit>` then restart both units.
   The previous code hardcodes `gpt-5-mini` with `reasoning.effort: "minimal"` for summaries,
   and reads transcription from `TRANSCRIPTION_MODEL` again.
+
+## xAI transcription configuration
+
+The app migration `20260930105323_add_transcription_provider.sql` adds
+`transcription_xai`, seeded with `grok-voice-transcribe-2.0`, NULL reasoning,
+verbosity and fallback. It never changes text task rows or overwrites an edited
+xAI row. OpenAI still reads `transcription`; no text function accepts a provider.
+
+`XAI_API_KEY` comes from `/etc/snipnote-transcription/env`, separate from the
+same-named Supabase Edge Function secret. Never store keys in database rows.
+A missing key fails with `xAI transcription is not configured`. The fixed xAI
+endpoint is `/v1/stt`; options precede the file, container filenames/MIME types
+are retained, and OpenAI-only/raw-audio fields are omitted. Explicit language
+sends `format=true`; auto language sends neither. Invalid/blank text fails.
+
+Provider is saved per job, including chunks and queued retries. Model IDs retain
+the existing 60-second cache semantics, so a job can observe a later model edit.
+A configured fallback is another model of the **same provider**, only for
+400/404. 401/403/429/5xx never trigger cross-provider fallback. See
+[DEPLOYMENT.md](DEPLOYMENT.md#saved-transcription-provider-release) for rollout.
