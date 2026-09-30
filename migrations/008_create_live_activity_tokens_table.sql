@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS live_activity_tokens (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   -- The token is placed in an APNs URL path by the worker: hex only, sane length.
-  CONSTRAINT live_activity_tokens_token_hex CHECK (token ~ '^[0-9a-fA-F]{32,512}$'),
+  -- (Not `{32,512}`: PostgreSQL regexes cap a repetition count at 255, so that pattern errors on every insert.)
+  CONSTRAINT live_activity_tokens_token_hex CHECK (token ~ '^[0-9a-fA-F]+$' AND length(token) BETWEEN 32 AND 512),
   CONSTRAINT live_activity_tokens_job_token_key UNIQUE (job_id, token)
 );
 
