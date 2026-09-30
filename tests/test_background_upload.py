@@ -159,7 +159,7 @@ class JwtTests(EnvBase):
             self.assertRejected(make_token())
 
     def test_fails_closed_when_unconfigured(self):
-        with patch.dict(os.environ, {'SUPABASE_JWT_SECRET': ''}):
+        with patch.dict(os.environ, {'SUPABASE_JWT_SECRET': '', 'SUPABASE_AUTH_REMOTE_VERIFY': 'false'}):
             self.assertRejected(make_token(), status=503)
 
     def test_bearer_header_parsing(self):
@@ -312,12 +312,12 @@ class CreateJobApiTests(EnvBase):
             return table
         table.insert.side_effect = insert
         with patch.object(sc.supabase, 'table', return_value=table):
-            r = self.api.post('/jobs', json={'user_id': 'u', 'meeting_id': 'm', 'audio_url': 'https://x.invalid/a'})  # no JWT needed
+            r = self.api.post('/jobs', json={'user_id': USER, 'meeting_id': MEETING, 'audio_url': f'{BASE}/storage/v1/object/public/recordings/{USER}/{MEETING}.m4a'})  # no JWT needed
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json(), {'job_id': 'job', 'status': 'pending', 'created_at': 'now'})
         self.assertEqual(inserted[0]['status'], 'pending')
         self.assertNotIn('storage_path', inserted[0])
-        self.assertEqual(self.api.post('/jobs', json={'meeting_id': 'm'}).status_code, 422)  # legacy still needs user_id
+        self.assertEqual(self.api.post('/jobs', json={'meeting_id': MEETING}).status_code, 422)  # legacy still needs user_id
 
 
 class StorageClientTests(unittest.TestCase):
