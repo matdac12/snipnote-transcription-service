@@ -263,7 +263,9 @@ those jobs using OpenAI. Keep xAI credentials until queued jobs are handled.
 ### xAI single-request transcription
 
 For `transcription_provider: xai` the worker no longer uses the two-level chunking:
-it streams the audio (one file, or the iOS upload chunks in order) to a temp dir,
+it streams regular audio downloads to a temp dir. For iOS chunked uploads, it
+downloads one upload chunk at a time using the existing storage client (that
+chunk is buffered in memory), writes it to disk, and preserves chunk order. It
 joins/re-encodes it with ffmpeg to one mono 16 kHz ~48 kbps MP3 (the concat *filter*
 is used because the iOS chunks are separately exported files, so byte/demuxer
 concatenation is unsafe), and sends ONE `POST /v1/stt` whose multipart body is
@@ -286,8 +288,10 @@ about 2x the audio size in `XAI_WORK_DIR` (default system temp; keep it off tmpf
 Knobs are documented in `deploy/env.example` (`XAI_SINGLE_REQUEST_ENABLED`,
 `XAI_SINGLE_REQUEST_MAX_BYTES`, `XAI_STT_TIMEOUT_SECONDS`,
 `XAI_SINGLE_REQUEST_MAX_ATTEMPTS`, `XAI_AUDIO_BITRATE_KBPS`,
-`XAI_FFMPEG_TIMEOUT_SECONDS`, `XAI_WORK_DIR`). The 500MB xAI file limit and any
-duration limit are unverified; the 100MB default is conservative.
+`XAI_FFMPEG_TIMEOUT_SECONDS`, `XAI_WORK_DIR`). The [xAI speech-to-text documentation](https://docs.x.ai/developers/model-capabilities/audio/speech-to-text)
+confirms a 500 MB file limit and MP3 support (checked 2026-09-30); the 100 MiB
+default is conservative. A maximum audio duration and real long-job timing
+remain unverified.
 
 Manual check on the VPS after `systemctl restart snipnote-worker`: submit a short
 (<1 min) xAI job and a 1h+ xAI job (regular and chunked upload), watch
