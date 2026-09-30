@@ -260,6 +260,24 @@ Stop new xAI submissions and drain or explicitly fail pending xAI jobs before
 rolling workers back to versions that ignore provider, or they could transcribe
 those jobs using OpenAI. Keep xAI credentials until queued jobs are handled.
 
+### Security hardening (audit of 2026-09-30)
+
+Everything below is additive; nothing breaks old app builds (they send no JWT).
+
+**Immediate mitigation, no deploy (do this first).** The unauthenticated `POST /transcribe`
+can burn provider credit and block the API process. Block it in nginx before shipping any code:
+
+```nginx
+# inside the `server { ... }` of /etc/nginx/sites-available/snipnote-api
+location = /transcribe { return 410; }
+```
+
+then `nginx -t && systemctl reload nginx`. The full `deploy/nginx-snipnote-api.conf` in this
+repo contains that block plus `limit_req` on `POST /jobs` (60/min per IP, burst 20, 429) and a
+64k `client_max_body_size` (the API only takes small JSON). The new Python code also answers 410
+on its own, so the nginx block stays as defence in depth. CORS is now off by default
+(`CORS_ALLOWED_ORIGINS`, exact origins only, `*` ignored; the iOS app needs none).
+
 ### Migration order (all optional features)
 
 Apply in numeric order; 006 must be **committed** before 007 is run (`ALTER TYPE ... ADD VALUE`):
