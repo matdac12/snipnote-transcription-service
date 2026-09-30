@@ -251,6 +251,187 @@ class ServerMinutesDebitUuidMeetingTypeTests(ServerMinutesDebitTests):
 
 
 @unittest.skipIf(pgserver is None, 'pgserver/psycopg2 not installed (optional)')
+class TranscriptionJobsRlsTests(unittest.TestCase):
+    """Migration 010 against the ORIGINAL policies of the iOS repo (tests/sql/ios_baseline.sql)."""
+
+    IOS_INSERT = ("INSERT INTO transcription_jobs (user_id, meeting_id, audio_url, status, transcript, duration, completed_at, overview, summary, actions, "
+                  "progress_percentage, current_stage) VALUES (%s, %s, 'https://x/recordings/u/m.m4a', 'completed', 't', 61.5, now(), 'o', 's', '[]'::jsonb, 100, 'Completed')")
+    IOS_UPDATE = ("UPDATE transcription_jobs SET user_id=%s, meeting_id=%s, audio_url='https://x/recordings/u/m.m4a', status='completed', transcript='t2', duration=61.5, "
+                  "error_message=NULL, completed_at=now(), overview='o', summary='s', actions='[]'::jsonb, progress_percentage=100, current_stage='Completed' WHERE id=%s")
+
+    def setUp(self):
+        self.db = Db()
+        self.addCleanup(self.db.close)
+        self.db.base()
+        self.db.run("INSERT INTO auth.users VALUES (%s), (%s)", (USER, OTHER))
+        self.meeting = str(uuid.uuid4())
+        self.db.migration('010_harden_transcription_jobs_rls.sql')
+        self.db.migration('012_enable_rls_audio_chunks.sql')
+
+    def as_user(self, who=USER, role='authenticated'):
+        self.db.as_role(role, who)
+
+    def row(self, status, user=USER, **cols):
+        """Insert a worker-side row (superuser bypasses RLS)."""
+        self.db.reset()
+        rid = str(uuid.uuid4())
+        self.db.run("INSERT INTO transcription_jobs (id, user_id, meeting_id, audio_url, status) VALUES (%s, %s, %s, 'https://x/a', %s)", (rid, user, self.meeting, status))
+        return rid
+
+    def denied(self, sql, args=None, error=psycopg2.errors.InsufficientPrivilege):
+        with self.assertRaises(error):
+            self.db.run(sql, args)
+        self.db.reset()
+
+    def test_legit_ios_insert_and_update_still_work(self):
+        self.as_user()
+        self.db.run(self.IOS_INSERT, (USER, self.meeting))
+        rid = self.db.run("SELECT id FROM transcription_jobs WHERE meeting_id=%s", (self.meeting,))[0][0]
+        self.db.run(self.IOS_UPDATE, (USER, self.meeting, rid))
+        self.assertEqual(self.db.run("SELECT transcript, status::text FROM transcription_jobs WHERE id=%s", (rid,))[0], ('t2', 'completed'))
+
+    def test_ios_update_of_a_failed_or_still_running_server_job_works(self):
+        """On-device fallback completes a job whose server run failed / is still pending or processing."""
+        for status in ('failed', 'pending', 'processing'):
+            rid = self.row(status)
+            self.as_user()
+            self.db.run(self.IOS_UPDATE, (USER, self.meeting, rid))
+            self.assertEqual(self.db.run("SELECT status::text FROM transcription_jobs WHERE id=%s", (rid,))[0][0], 'completed')
+            self.db.reset()
+
+    def test_user_cannot_queue_a_job_through_postgrest(self):
+        for status in ('pending', 'processing', 'awaiting_upload', 'failed'):
+            self.as_user()
+            self.denied("INSERT INTO transcription_jobs (user_id, meeting_id, audio_url, status) VALUES (%s, %s, 'http://169.254.169.254/', %s)",
+                        (USER, self.meeting, status))
+        # status omitted -> column default 'pending' -> not 'completed' -> RLS violation
+        self.as_user()
+        self.denied("INSERT INTO transcription_jobs (user_id, meeting_id, audio_url) VALUES (%s, %s, 'http://169.254.169.254/')", (USER, self.meeting))
+
+    def test_user_cannot_requeue_or_retarget_an_existing_row(self):
+        rid = self.row('completed')
+        for set_clause in ("status='pending'", "status='processing'", "status='awaiting_upload'", "status='failed'"):
+            self.as_user()
+            self.denied(f"UPDATE transcription_jobs SET {set_clause} WHERE id=%s", (rid,), psycopg2.errors.InsufficientPrivilege)
+        self.assertEqual(self.db.run("SELECT status::text FROM transcription_jobs WHERE id=%s", (rid,))[0][0], 'completed')
+
+    def test_user_cannot_touch_worker_owned_columns(self):
+        rid = self.row('pending')
+        for col, value in (('transcription_provider', "'xai'"), ('is_chunked', 'true'), ('total_chunks', '500'),
+                           ('storage_path', "'other/x.m4a'"), ('expected_bytes', '1'), ('upload_deadline', 'now()'), ('stage', "'queued'"),
+                           ('language', "'it'"), ('created_at', 'now()'), ('id', 'gen_random_uuid()'), ('chunks_processed', '3')):
+            self.as_user()
+            self.denied(f"UPDATE transcription_jobs SET {col}={value} WHERE id=%s", (rid,))
+            self.as_user()
+            self.denied(f"INSERT INTO transcription_jobs (user_id, meeting_id, status, {col}) VALUES (%s, %s, 'completed', {value})", (USER, self.meeting))
+
+    def test_user_cannot_touch_the_billing_columns_of_migration_011(self):
+        self.db.ledger('text')
+        self.db.migration('011_server_minutes_debit.sql')
+        rid = self.row('completed')
+        for col, value in (('billable_seconds', '1'), ('minutes_debited', '0'), ('debited_at', 'now()'), ('debit_status', "'debited'")):
+            self.as_user()
+            self.denied(f"UPDATE transcription_jobs SET {col}={value} WHERE id=%s", (rid,))
+
+    def test_user_cannot_write_other_users_rows(self):
+        other_row = self.row('completed', user=OTHER)
+        mine = self.row('completed')
+        self.as_user()
+        self.denied(self.IOS_INSERT, (OTHER, self.meeting))
+        self.as_user()
+        self.db.run("UPDATE transcription_jobs SET transcript='hacked' WHERE id=%s", (other_row,))   # RLS hides the row: 0 rows updated
+        self.db.reset()
+        self.assertIsNone(self.db.run("SELECT transcript FROM transcription_jobs WHERE id=%s", (other_row,))[0][0])
+        self.as_user()
+        self.denied("UPDATE transcription_jobs SET user_id=%s WHERE id=%s", (OTHER, mine))   # cannot hand a row to someone else
+
+    def test_no_delete_no_anon_and_select_still_scoped(self):
+        mine, theirs = self.row('completed'), self.row('completed', user=OTHER)
+        self.as_user()
+        self.denied("DELETE FROM transcription_jobs WHERE id=%s", (mine,))
+        self.as_user()
+        self.assertEqual([r[0] for r in self.db.run("SELECT id::text FROM transcription_jobs")], [mine])
+        self.db.reset()
+        self.as_user(role='anon')
+        self.denied("SELECT * FROM transcription_jobs")
+        self.as_user(role='anon')
+        self.denied(self.IOS_INSERT, (USER, self.meeting))
+
+    def test_service_role_keeps_full_control(self):
+        rid = self.row('pending')
+        self.db.as_role('service_role')
+        self.db.run("UPDATE transcription_jobs SET status='processing', stage='transcribing', transcription_provider='xai' WHERE id=%s", (rid,))
+        self.db.run("UPDATE transcription_jobs SET status='pending' WHERE id=%s", (rid,))
+        self.db.run("INSERT INTO transcription_jobs (user_id, meeting_id, status, storage_path) VALUES (%s, %s, 'awaiting_upload', 'p')", (USER, self.meeting))
+        self.db.run("DELETE FROM transcription_jobs WHERE id=%s", (rid,))
+        self.db.reset()
+
+    def test_live_activity_token_policy_still_works(self):
+        rid = self.row('pending')
+        self.as_user()
+        self.db.run("INSERT INTO live_activity_tokens (job_id, user_id, token, environment) VALUES (%s, %s, %s, 'sandbox')", (rid, USER, 'ab' * 32))
+        self.db.reset()
+
+    def test_retry_count_is_not_defined_by_any_repo_migration(self):
+        """Documents a gap: supabase_client.increment_retry_count writes retry_count, but no migration creates it."""
+        cols = [r[0] for r in self.db.run("SELECT column_name FROM information_schema.columns WHERE table_name='transcription_jobs'")]
+        self.assertNotIn('retry_count', cols)
+
+    def test_migration_is_idempotent_and_policies_are_exactly_ours(self):
+        self.db.migration('010_harden_transcription_jobs_rls.sql')
+        names = sorted(r[0] for r in self.db.run("SELECT policyname FROM pg_policies WHERE tablename='transcription_jobs'"))
+        self.assertEqual(names, sorted(['Users can insert completed transcription results', 'Users can update own rows to completed results',
+                                        'Users can view their own transcription jobs', 'Service role has full access to transcription jobs']))
+
+    def test_warns_about_foreign_permissive_policies(self):
+        self.db.run('CREATE POLICY dashboard_made ON transcription_jobs FOR INSERT TO authenticated WITH CHECK (true)')
+        self.db.conn.notices.clear()
+        self.db.migration('010_harden_transcription_jobs_rls.sql')
+        self.assertTrue(any('dashboard_made' in n for n in self.db.conn.notices))
+
+    # --- audio_chunks (012) ---
+    def chunk_insert(self, path, user=USER, idx=0):
+        return self.db.run("INSERT INTO audio_chunks (meeting_id, user_id, chunk_index, total_chunks, file_path, file_size, duration_seconds) VALUES (%s, %s, %s, 2, %s, 10, 5)",
+                           (self.meeting, user, idx, path))
+
+    def test_audio_chunks_legit_insert_and_scoped_select(self):
+        self.as_user()
+        self.chunk_insert(f'{USER}/{self.meeting}_chunk_0.m4a')
+        self.assertEqual(len(self.db.run('SELECT * FROM audio_chunks')), 1)
+        self.db.reset()
+        self.as_user(OTHER)
+        self.assertEqual(self.db.run('SELECT * FROM audio_chunks'), [])
+
+    def test_audio_chunks_rejects_foreign_or_traversal_paths_and_other_writes(self):
+        self.as_user()
+        for bad in (f'{OTHER}/x_chunk_0.m4a', 'one', f'{USER}/../{OTHER}/x.m4a', f'{USER.upper()}/x.m4a'):
+            with self.assertRaises(psycopg2.errors.InsufficientPrivilege):
+                self.chunk_insert(bad)
+            self.db.reset(); self.as_user()
+        with self.assertRaises(psycopg2.errors.InsufficientPrivilege):
+            self.chunk_insert(f'{OTHER}/x_chunk_0.m4a', user=OTHER)
+        self.db.reset(); self.as_user()
+        with self.assertRaises(psycopg2.errors.InsufficientPrivilege):
+            self.db.run("UPDATE audio_chunks SET transcript='x'")
+        self.db.reset(); self.as_user()
+        with self.assertRaises(psycopg2.errors.InsufficientPrivilege):
+            self.db.run("DELETE FROM audio_chunks")
+        self.db.reset()
+        self.as_user(role='anon')
+        with self.assertRaises(psycopg2.errors.InsufficientPrivilege):
+            self.db.run("SELECT * FROM audio_chunks")
+        self.db.reset()
+
+    def test_worker_can_still_update_chunks(self):
+        self.as_user()
+        self.chunk_insert(f'{USER}/{self.meeting}_chunk_0.m4a')
+        self.db.reset()
+        self.db.as_role('service_role')
+        self.db.run("UPDATE audio_chunks SET transcript='done', transcribed=true")
+        self.db.reset()
+
+
+@unittest.skipIf(pgserver is None, 'pgserver/psycopg2 not installed (optional)')
 class MissingLedgerTests(unittest.TestCase):
     def test_migration_011_aborts_cleanly_without_the_ledger_functions(self):
         db = Db()
