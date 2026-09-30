@@ -260,9 +260,46 @@ Stop new xAI submissions and drain or explicitly fail pending xAI jobs before
 rolling workers back to versions that ignore provider, or they could transcribe
 those jobs using OpenAI. Keep xAI credentials until queued jobs are handled.
 
+### xAI single-request transcription
+
+For `transcription_provider: xai` the worker no longer uses the two-level chunking:
+it streams the audio (one file, or the iOS upload chunks in order) to a temp dir,
+joins/re-encodes it with ffmpeg to one mono 16 kHz ~48 kbps MP3 (the concat *filter*
+is used because the iOS chunks are separately exported files, so byte/demuxer
+concatenation is unsafe), and sends ONE `POST /v1/stt` whose multipart body is
+streamed from disk. Summary/overview/actions (OpenAI), result saving and the
+job `duration` are unchanged (`duration` is now measured with ffprobe instead of
+the `bytes/32000` estimate for regular jobs; chunked jobs still prefer the job's
+own duration). OpenAI jobs and `/transcribe` are untouched.
+
+Fallback to the previous chunked xAI path (no job failure) happens when: the kill
+switch is off, ffmpeg fails/is missing, the prepared file exceeds
+`XAI_SINGLE_REQUEST_MAX_BYTES`, or the request still fails after
+`XAI_SINGLE_REQUEST_MAX_ATTEMPTS` (timeouts, connection errors, 408/425/429/5xx) or
+with any other non-auth error (e.g. 413). 401/403 and a missing `XAI_API_KEY` fail
+the job (chunking cannot help). Caveat: a read timeout after xAI already finished
+would be billed twice (single request + chunked fallback).
+
+Requirements: `ffmpeg` and `ffprobe` on the worker's PATH (the apt `ffmpeg`
+package provides both; `install_ffmpeg.sh` already installs it) and free disk of
+about 2x the audio size in `XAI_WORK_DIR` (default system temp; keep it off tmpfs).
+Knobs are documented in `deploy/env.example` (`XAI_SINGLE_REQUEST_ENABLED`,
+`XAI_SINGLE_REQUEST_MAX_BYTES`, `XAI_STT_TIMEOUT_SECONDS`,
+`XAI_SINGLE_REQUEST_MAX_ATTEMPTS`, `XAI_AUDIO_BITRATE_KBPS`,
+`XAI_FFMPEG_TIMEOUT_SECONDS`, `XAI_WORK_DIR`). The 500MB xAI file limit and any
+duration limit are unverified; the 100MB default is conservative.
+
+Manual check on the VPS after `systemctl restart snipnote-worker`: submit a short
+(<1 min) xAI job and a 1h+ xAI job (regular and chunked upload), watch
+`journalctl -u snipnote-worker -f` for `xAI single request:` lines, confirm stages
+"Downloading audio / Preparing audio / Transcribing audio", check `ls
+${XAI_WORK_DIR:-/tmp}/snipnote-xai-*` is empty afterwards and peak RSS
+(`systemd-cgtop`) stays well under 1500M. Roll back instantly with
+`XAI_SINGLE_REQUEST_ENABLED=false` + worker restart.
+
 Offline verification (no production credentials):
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q main.py ai_config.py transcription_provider.py transcribe.py jobs.py supabase_client.py
+python -m compileall -q main.py ai_config.py transcription_provider.py transcribe.py jobs.py supabase_client.py xai_single.py
 ```
