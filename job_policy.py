@@ -18,7 +18,7 @@ MODE-DEPENDENT:
   * token required (401)                                           enforce only
   * `recordings` row (regular) / `audio_chunks` rows (chunked) for (user_id, meeting_id)
     must exist and match the URL path                               enforce: 404; log: logged as "would reject"; off: skipped
-  * (minutes flag, separate) balance check -> 402                   only with SERVER_MINUTES_DEBIT_ENABLED, any mode
+  * (minutes flag, separate) balance check -> 402                   only with SERVER_MINUTES_DEBIT_ENABLED, any mode; see check_balance
 
 Lookups that fail (table missing, DB hiccup) never block a request: they are logged and skipped.
 """
@@ -29,6 +29,7 @@ from typing import Any, Dict, Optional
 from fastapi import HTTPException
 
 import audio_access
+import minutes
 import supabase_client as db
 
 DEFAULT_MAX_ACTIVE_JOBS = 20
@@ -49,11 +50,6 @@ def max_active_jobs() -> int:
 
 def max_duration_seconds() -> int:
     return _env_int('MAX_JOB_DURATION_SECONDS', DEFAULT_MAX_DURATION_SECONDS)
-
-
-def minutes_for(seconds: Optional[float]) -> int:
-    """Same rounding as the app's debit: max(1, ceil(seconds / 60))."""
-    return max(1, math.ceil((seconds or 0) / 60)) if seconds else 0
 
 
 def _log(message: str) -> None:
@@ -115,13 +111,19 @@ def check_ownership(mode: str, user_id: str, meeting_id: str, is_chunked: bool, 
     return info
 
 
-def find_or_cap_active(user_id: str, meeting_id: str) -> Optional[Dict[str, Any]]:
-    """Always on. Returns an existing active job of this meeting (idempotent create), raises 429
-    when the user already has too many active jobs. Lookup failures are logged and skipped."""
+def load_active(user_id: str) -> Optional[list]:
+    """The user's queued/running jobs, or None if they cannot be listed (logged, never blocks)."""
     try:
-        active = db.list_active_jobs(user_id)
+        return db.list_active_jobs(user_id)
     except Exception as error:
         _log(f'active-job lookup skipped ({type(error).__name__})')
+        return None
+
+
+def find_or_cap_active(user_id: str, meeting_id: str, active: Optional[list] = None) -> Optional[Dict[str, Any]]:
+    """Always on. Returns an existing active job of this meeting (idempotent create), raises 429
+    when the user already has too many active jobs."""
+    if active is None:
         return None
     for job in active:
         if str(job.get('meeting_id', '')).lower() == meeting_id.lower() and job.get('status') in ('pending', 'processing'):
@@ -131,3 +133,30 @@ def find_or_cap_active(user_id: str, meeting_id: str) -> Optional[Dict[str, Any]
         raise HTTPException(status_code=429, detail='Too many transcription jobs in progress, try again later',
                             headers={'Retry-After': '60'})
     return None
+
+
+def check_balance(user_id: str, meeting_id: str, seconds: Optional[float], active: Optional[list]) -> None:
+    """Only with SERVER_MINUTES_DEBIT_ENABLED (any AUTH_MODE): 402 when the balance cannot cover this
+    job plus the minutes of the user's other queued/running jobs (they will all be debited when done).
+
+    Applied only where the balance source is known: `get_minutes_balance_for_user` (migration 011,
+    wraps the app's get_user_minutes_balance). Unknown duration, unknown balance or a failing RPC
+    never block a request (logged)."""
+    if not minutes.debit_enabled():
+        return
+    needed = minutes.minutes_for_seconds(seconds)
+    if needed <= 0:
+        return
+    try:
+        balance = db.get_minutes_balance(user_id)
+    except Exception as error:
+        _log(f'balance check skipped ({type(error).__name__}); is migration 011 applied?')
+        return
+    if balance is None:
+        _log('balance check skipped (balance unknown)')
+        return
+    reserved = sum(minutes.minutes_for_seconds(j.get('duration')) for j in (active or [])
+                   if j.get('status') in ('pending', 'processing') and str(j.get('meeting_id', '')).lower() != meeting_id.lower())
+    if balance < needed + reserved:
+        raise HTTPException(status_code=402, detail={
+            'error': 'insufficient_minutes', 'required_minutes': needed, 'reserved_minutes': reserved, 'balance_minutes': balance})

@@ -194,10 +194,12 @@ async def create_legacy_job(request: CreateJobRequest, authorization: str | None
     meeting_id = request.meeting_id.lower()
 
     def blocking_part():
-        existing = job_policy.find_or_cap_active(user_id, meeting_id)
+        active = job_policy.load_active(user_id)
+        existing = job_policy.find_or_cap_active(user_id, meeting_id, active)
         if existing:
             return existing, None
         info = job_policy.check_ownership(mode, user_id, meeting_id, request.is_chunked, request.total_chunks, storage_path)
+        job_policy.check_balance(user_id, meeting_id, request.duration or info["seconds"], active)
         job = create_job(
             user_id=user_id,
             meeting_id=meeting_id,
@@ -230,19 +232,25 @@ async def create_upload_pending_job(request: CreateJobRequest, authorization: st
     user = await run_in_threadpool(auth.authenticate_header, authorization)
     if request.user_id and request.user_id.lower() != user.user_id:
         raise HTTPException(status_code=403, detail="user_id does not match the authenticated user")
-    try:
-        result = await run_in_threadpool(
-            lambda: background_upload.create_upload_job(
-                user_id=user.user_id,  # from the verified token, never from the body
-                meeting_id=request.meeting_id,
-                expected_bytes=request.expected_bytes,
-                file_extension=request.file_extension,
-                content_type=request.content_type,
-                duration=request.duration,
-                language=request.language,
-                provider=request.transcription_provider,
-            )
+    def create_upload():
+        # Balance check first (flag-gated, no-op otherwise). Needs the caller's queued jobs to reserve their minutes.
+        job_policy.check_balance(user.user_id, (request.meeting_id or "").lower(), request.duration,
+                                 job_policy.load_active(user.user_id))
+        return background_upload.create_upload_job(
+            user_id=user.user_id,  # from the verified token, never from the body
+            meeting_id=request.meeting_id,
+            expected_bytes=request.expected_bytes,
+            file_extension=request.file_extension,
+            content_type=request.content_type,
+            duration=request.duration,
+            language=request.language,
+            provider=request.transcription_provider,
         )
+
+    try:
+        result = await run_in_threadpool(create_upload)
+    except HTTPException:
+        raise
     except background_upload.UploadRequestError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail)
     except Exception as error:
