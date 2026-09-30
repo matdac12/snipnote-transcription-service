@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends, Form, Request
+from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -7,7 +7,6 @@ from typing import Literal
 import uvicorn
 import os
 import warnings
-from transcribe import transcribe_audio
 from supabase_client import create_job, get_job
 import auth
 import background_upload
@@ -105,13 +104,20 @@ class JobStatusResponse(BaseModel):
     expected_bytes: int | None = None
     upload_deadline: str | None = None
 
-# Allow all origins for testing (will restrict later)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS: the iOS app is not a browser and needs none. Default = no CORS headers at all.
+# Set CORS_ALLOWED_ORIGINS to a comma-separated list of exact origins if a web client is added.
+def cors_allowed_origins() -> list[str]:
+    return [o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip() and o.strip() != "*"]
+
+
+_cors_origins = cors_allowed_origins()
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-API-Key"],
+    )
 
 @app.exception_handler(auth.AuthError)
 async def auth_error_handler(request: Request, exc: auth.AuthError):
@@ -220,28 +226,14 @@ async def get_job_status(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve job: {str(e)}")
 
 
-@app.post("/transcribe")
-async def transcribe(
-    request: Request,
-    file: UploadFile = File(...),
-    language: str | None = Form(None),  # Optional ISO-639-1 code
-    transcription_provider: Literal["openai", "xai"] = Form("openai")
-):
-    # FastAPI replaces empty form values with defaults; distinguish an explicit
-    # invalid value from an omitted field before it can reach a provider.
-    form = await request.form()
-    if "transcription_provider" in form and form["transcription_provider"] not in ("openai", "xai"):
-        raise HTTPException(status_code=422, detail="Invalid transcription provider")
-    try:
-        # Read audio file
-        audio_data = await file.read()
+@app.api_route("/transcribe", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], include_in_schema=False)
+async def transcribe_removed():
+    """Removed: the synchronous endpoint was unauthenticated and ran OpenAI/xAI inside the API
+    process (credit burn, event-loop DoS). The iOS app never called it; use POST /jobs.
 
-        # Transcribe (language=None means auto-detect)
-        result = transcribe_audio(audio_data, file.filename, language=language, provider=transcription_provider)
-
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    Declares no body parameters on purpose: FastAPI then never reads the (up to nginx's
+    `client_max_body_size`) upload, it just answers 410."""
+    return JSONResponse(status_code=410, content={"detail": "POST /transcribe has been removed. Use POST /jobs."})
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

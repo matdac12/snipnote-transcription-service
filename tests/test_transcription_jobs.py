@@ -87,16 +87,23 @@ class JobTests(unittest.TestCase):
         self.run_worker(provider=None)
         self.run_worker(chunked=True, provider=None)
 
-    def test_synchronous_endpoint_routes_provider(self):
-        with patch.object(main, 'transcribe_audio', return_value={'transcript': 'text', 'duration': 1}) as transcribe:
-            response = self.api.post('/transcribe', files={'file': ('meeting.m4a', b'audio', 'audio/mp4')}, data={'transcription_provider': 'xai', 'language': 'it'})
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(transcribe.call_args.kwargs.get('provider'), 'xai')
-            response = self.api.post('/transcribe', files={'file': ('meeting.m4a', b'audio')}, data={'transcription_provider': 'unknown'})
-            self.assertEqual(response.status_code, 422)
-
-    def test_synchronous_empty_provider_is_rejected(self):
-        with patch.object(main, 'transcribe_audio') as transcribe:
-            response = self.api.post('/transcribe', files={'file': ('meeting.m4a', b'audio')}, data={'transcription_provider': ''})
-            self.assertEqual(response.status_code, 422)
+    def test_synchronous_endpoint_is_gone(self):
+        # /transcribe was unauthenticated and ran transcription inside the API process.
+        with patch.object(jobs, 'transcribe_audio') as transcribe:
+            for method in ('post', 'get', 'put'):
+                response = getattr(self.api, method)('/transcribe')
+                self.assertEqual(response.status_code, 410, method)
+            response = self.api.post('/transcribe', files={'file': ('meeting.m4a', b'audio', 'audio/mp4')}, data={'transcription_provider': 'xai'})
+            self.assertEqual(response.status_code, 410)
+            self.assertIn('POST /jobs', response.json()['detail'])
             transcribe.assert_not_called()
+        self.assertFalse(hasattr(main, 'transcribe_audio'), 'main must not import the transcription code any more')
+
+    def test_no_cors_by_default_and_wildcard_is_ignored(self):
+        self.assertEqual([m for m in main.app.user_middleware if 'CORS' in m.cls.__name__], [])
+        with patch.dict(os.environ, {'CORS_ALLOWED_ORIGINS': ''}):
+            self.assertEqual(main.cors_allowed_origins(), [])
+        with patch.dict(os.environ, {'CORS_ALLOWED_ORIGINS': ' https://a.example , *, https://b.example '}):
+            self.assertEqual(main.cors_allowed_origins(), ['https://a.example', 'https://b.example'])
+        response = self.api.get('/', headers={'Origin': 'https://evil.example'})
+        self.assertNotIn('access-control-allow-origin', response.headers)

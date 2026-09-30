@@ -240,8 +240,8 @@ configuration commits ending at `5176d6b`; deploy these together with the featur
 4. Run staging smoke tests, then release iOS last.
 
 `POST /jobs` accepts `transcription_provider: openai|xai` for regular and chunked
-jobs; the DB stores the value and GET status returns it. `/transcribe` accepts
-that same multipart field. Missing fields/legacy jobs default to OpenAI; explicit
+jobs; the DB stores the value and GET status returns it (`/transcribe` no longer exists,
+it answers 410). Missing fields/legacy jobs default to OpenAI; explicit
 unknown values return 422. Workers retain the stored choice across parallel
 chunks, internal chunking and retries; no provider failure changes provider.
 Model rows `transcription`/`transcription_xai` use the existing 60-second cache.
@@ -331,7 +331,7 @@ concatenation is unsafe), and sends ONE `POST /v1/stt` whose multipart body is
 streamed from disk. Summary/overview/actions (OpenAI), result saving and the
 job `duration` are unchanged (`duration` is now measured with ffprobe instead of
 the `bytes/32000` estimate for regular jobs; chunked jobs still prefer the job's
-own duration). OpenAI jobs and `/transcribe` are untouched.
+own duration). OpenAI jobs are untouched.
 
 Fallback to the previous chunked xAI path (no job failure) happens when: the kill
 switch is off, ffmpeg fails/is missing, the prepared file exceeds

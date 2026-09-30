@@ -21,10 +21,9 @@ Deployed on the `omni` VPS at `https://api.snipnote.app` — see [DEPLOYMENT.md]
    python main.py
    ```
 
-4. Test endpoint:
+4. Test endpoint (there is no synchronous endpoint any more; see `POST /jobs` below):
    ```bash
-   curl -X POST http://localhost:8000/transcribe \
-     -F "file=@test-audio.m4a"
+   curl http://localhost:8000/
    ```
 
 ## Deployment to Render
@@ -91,10 +90,9 @@ The `render.yaml` file automatically configures both the web service and cron wo
   [DEPLOYMENT.md](DEPLOYMENT.md#background-upload-upload_pending). The user comes from the
   verified JWT (`auth.py`), never from the body. Legacy requests (no `upload_pending`) behave as before.
 
-### Legacy Sync Endpoint
-- `POST /transcribe` - Upload audio file for synchronous transcription
-  - Accepts: multipart/form-data with `file` field
-  - Returns: `{"transcript": "...", "duration": 123.5}`
+### Removed: `/transcribe`
+`POST /transcribe` (synchronous, unauthenticated, ran the provider inside the API process) now
+answers **410 Gone**; the iOS app never called it. Use `POST /jobs`.
 
 ## Testing Endpoints
 
@@ -120,8 +118,7 @@ curl -X GET https://api.snipnote.app/jobs/{job_id} \
 
 New jobs can choose `transcription_provider: "openai"` or `"xai"`; omitted
 selection defaults to OpenAI. Regular and chunked workers retain it for the whole
-job, including retries, and never switch providers on failure. The synchronous
-`/transcribe` route accepts the same field as multipart form data. Unknown values
+job, including retries, and never switch providers on failure. Unknown values
 return 422. Status responses include the stored provider.
 
 Models resolve from Supabase `ai_model_config` rows `transcription` and
