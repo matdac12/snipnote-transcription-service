@@ -49,3 +49,16 @@ class UploadDatabaseTests(unittest.TestCase):
     def test_unverified_file_cannot_promote(self):
         with psycopg.connect(DSN) as c:c.execute('update background_upload_files set verified_at=null where session_id=%s',(self.sid,))
         with self.assertRaises(psycopg.errors.RaiseException):self.promote()
+
+    def test_registration_metadata_failure_is_atomic(self):
+        from psycopg.types.json import Jsonb
+        sid,mid,job=uuid4(),uuid4(),uuid4()
+        with psycopg.connect(DSN) as c:
+            c.execute("insert into meetings(id,user_id,name) values (%s,%s,'registration rollback')",(mid,self.user))
+        session=dict(id=str(sid),user_id=str(self.user),meeting_id=str(mid),reserved_job_id=str(job),manifest_digest='registration',transcription_provider='xai',duration=10,upload_deadline='2099-01-01T00:00:00Z')
+        files=[dict(index=0,path='same-'+str(sid),expected_bytes=50,duration=5,content_type='audio/mp4'),dict(index=1,path='same-'+str(sid),expected_bytes=50,duration=5,content_type='audio/mp4')]
+        with self.assertRaises(psycopg.errors.UniqueViolation):
+            with psycopg.connect(DSN) as c:
+                c.execute('set local role service_role')
+                c.execute('select register_background_upload(%s,%s)',(Jsonb(session),Jsonb(files)))
+        with psycopg.connect(DSN) as c:self.assertEqual(c.execute('select count(*) from background_upload_sessions where id=%s',(sid,)).fetchone()[0],0)

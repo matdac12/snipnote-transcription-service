@@ -291,3 +291,80 @@ Never set this test DSN to production. Migration scripts have 5-second lock and
 30-second statement timeouts. Anonymous/authenticated roles have no upload table
 privileges and cannot execute either RPC. The service verifies identity through
 Supabase Auth and checks meeting/session ownership before signing or reading.
+
+### Concrete production approval checkpoint
+
+Read-only preflight on 2026-10-01: API/ordinary worker active, health endpoint healthy,
+VPS revision `7cc8460d8904154f2a34303abd28bde6cd92bdbf`, approximately 12 GB free.
+The visible backup timers/files are OS package backups, **not verified database
+backups**. Confirm Supabase backup/PITR availability and restore procedure before
+approval. Supabase's latest observed migration is `20260930113230`.
+
+Only these app-repository files are candidates for migration approval:
+
+1. `20261001064743_background_upload_sessions.sql`
+2. `20261001065143_promote_background_upload.sql`
+
+Do not run a blanket `supabase db push`: this checkout has older migrations/history
+that do not exactly match production. Review/apply these two named additions through
+the existing approved migration workflow, maintaining history. No existing table,
+enum, trigger, RLS policy or bucket setting is replaced. The current completion
+cleanup trigger removes ordinary audio chunks; the new app retains its durable
+source for playback. The upload reconciler itself deletes no queued/completed audio.
+
+After approval ONLY (not executed by this implementation):
+
+```bash
+# On omni, after transferring/fetching the reviewed feature revision:
+cd /opt/snipnote-transcription
+git status --short
+git rev-parse HEAD  # retain this revision for rollback
+git checkout <approved-service-commit>
+.venv/bin/pip install -r requirements.txt
+# Edit /etc/snipnote-transcription/env, preserving all existing entries:
+# BACKGROUND_UPLOAD_ENABLED=false
+# BACKGROUND_UPLOAD_ALLOWED_USERS=
+cp deploy/snipnote-upload-reconciler.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl restart snipnote-api
+systemctl enable --now snipnote-upload-reconciler
+curl -fsS http://127.0.0.1:8100/
+systemctl is-active snipnote-api snipnote-worker snipnote-upload-reconciler
+```
+
+The ordinary worker is not restarted/reconfigured here; it reads the unchanged
+pending-job contract. Run legacy smoke checks with the shipped app before enabling
+anything. Verify the approved service SHA is a descendant of local service base
+`6764cb4` with the xAI whole-file revert retained; do not deploy the reference branch.
+
+Owner activation is a **separate approval**: verify the owner's UUID through Auth,
+set the allowlist to that one UUID, then enable the gate and restart the API. Never
+use an email/client-provided UUID or an empty allowlist as a substitute. No account
+has been selected/enabled in this change.
+
+### Production transport proof still required
+
+Before paid/device trial, use tiny disposable owner-scoped audio files to prove the
+pinned SDK's signed PUT/multipart instructions against the actual recordings bucket.
+Offline characterization is evidence of SDK behavior, not production acceptance.
+Use fixtures that cannot promote: an extra deliberately absent manifest file, or a
+wrong expected byte count. Keep them below the 15 MiB per-file limit. Verify exact
+bytes, interrupted retry, credential expiry/refresh and no credentials for verified
+objects. Cancel the fixture session via reviewed service-role maintenance and remove
+only its unreferenced synthetic storage objects/tables; do not submit a fully
+verified probe that invokes paid transcription. Recheck ordinary job/reconciler
+independence during a long job. Record sanitized results.
+
+For rollback, set `BACKGROUND_UPLOAD_ENABLED=false` and restart the API. Leave
+session endpoints and the reconciler running so existing sessions can refresh/finish.
+Keep additive tables and completed results. A full code rollback to a revision
+without session support pauses unfinished uploads; preserve manifests/files and
+restore compatible support to resume. Do not create a second legacy job.
+
+### Owner TestFlight acceptance (pending)
+
+Archive the ordinary production app/share-extension target; retain the existing
+SwiftData store and production endpoints. Match version/build numbers in both
+bundles. The app report contains the focused physical-device matrix. The 7–10-day
+owner-only trial, App Store replacement/data continuity checks, wider activation
+and release remain owner actions after deployment/activation approvals.
