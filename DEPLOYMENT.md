@@ -266,3 +266,28 @@ Offline verification (no production credentials):
 python -m unittest discover -s tests -v
 python -m compileall -q main.py ai_config.py transcription_provider.py transcribe.py jobs.py supabase_client.py
 ```
+
+## Background upload rollout (approval pending)
+
+Keep the existing worker and its concurrency unchanged. New tables and service-only
+RPCs are owned by the app repository's Supabase migrations; do not copy migrations
+into this repository. Add `BACKGROUND_UPLOAD_ENABLED=false` and an empty
+`BACKGROUND_UPLOAD_ALLOWED_USERS` to the existing environment. Install the separate
+`deploy/snipnote-upload-reconciler.service` only after migration/deployment approval.
+It scans at most 100 sessions every 20 seconds and never invokes transcription.
+Expired sessions retain objects for retry; this process deletes no audio. Verified
+and queued files remain referenced by ordinary chunk/job metadata.
+
+Local rehearsal uses PostgreSQL 17 and `tests/upload_legacy_fixture.sql` (synthetic
+legacy schema only), followed by the two app migrations, then:
+
+```bash
+python3.12 -m venv .venv-test
+.venv-test/bin/pip install -r requirements-test.txt
+UPLOAD_TEST_DATABASE_URL='<disposable-local-dsn>' .venv-test/bin/python -m unittest discover -s tests -v
+```
+
+Never set this test DSN to production. Migration scripts have 5-second lock and
+30-second statement timeouts. Anonymous/authenticated roles have no upload table
+privileges and cannot execute either RPC. The service verifies identity through
+Supabase Auth and checks meeting/session ownership before signing or reading.

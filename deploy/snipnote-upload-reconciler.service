@@ -1,0 +1,18 @@
+[Unit]
+Description=SnipNote independent background upload reconciler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/snipnote-transcription
+EnvironmentFile=/etc/snipnote-transcription/env
+ExecStart=/opt/snipnote-transcription/.venv/bin/python upload_worker.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

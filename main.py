@@ -171,9 +171,6 @@ async def transcribe(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
 # New endpoints deliberately do not change legacy /jobs authentication/contracts.
 from upload_auth import verify_upload_user
 from upload_models import UploadBootstrapRequest, UploadSessionResponse
@@ -194,3 +191,6 @@ def create_upload_session(request: UploadBootstrapRequest, user_id: str = Depend
 @app.get('/upload-sessions/{session_id}', response_model=UploadSessionResponse, response_model_exclude_none=True)
 def upload_session_status(session_id: UUID, user_id: str = Depends(upload_identity)):
     return get_upload_session(user_id, str(session_id))
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
