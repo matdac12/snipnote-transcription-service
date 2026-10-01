@@ -43,6 +43,13 @@ class UploadSessions:
         if state=='awaiting_upload' and utc(session['upload_deadline'])<=datetime.now(timezone.utc):state='expired'
         files=[]
         for f in self.repo.list_files(session['id']):
+            if sign and state=='awaiting_upload' and f.get('verified_at') is None:
+                try:
+                    if self.storage.size_of(f['path']) == f['expected_bytes']:
+                        self.repo.mark_verified(session['id'],f['index'])
+                        f['verified_at']=datetime.now(timezone.utc).isoformat()
+                except Exception:
+                    raise HTTPException(503,detail={'code':'upload_verification_unavailable'}) from None
             item=UploadFileResponse(index=f['index'],verified=f.get('verified_at') is not None)
             if sign and state=='awaiting_upload' and not item.verified:
                 try:
@@ -68,13 +75,23 @@ class SupabaseUploadRepository:
         return self.find(session['user_id'],session['meeting_id'])
     def list_files(self,sid):
         return self.client.table('background_upload_files').select('*').eq('session_id',sid).order('index').execute().data
+    def mark_verified(self,sid,index):
+        self.client.table("background_upload_files").update({"verified_at":datetime.now(timezone.utc).isoformat()}).eq("session_id",sid).eq("index",index).execute()
     def renew(self,sid,deadline):
         # Status predicate prevents refresh racing promotion from regressing queued.
         self.client.table('background_upload_sessions').update({'status':'awaiting_upload','upload_deadline':deadline,'updated_at':datetime.now(timezone.utc).isoformat()}).eq('id',sid).in_('status',['expired','awaiting_upload']).execute()
         return self.get(sid)
 
 class SupabaseUploadStorage:
-    def __init__(self,client):self.bucket=client.storage.from_('recordings')
+    def __init__(self,client):
+        self.bucket=client.storage.from_('recordings')
+    def size_of(self,path):
+        parent,name=path.rsplit('/',1)
+        for obj in self.bucket.list(parent,{'limit':100,'search':name}):
+            if obj.get('name')==name:
+                size=(obj.get('metadata') or {}).get('size')
+                return int(size) if size is not None else None
+        return None
     def sign(self,path,content_type,boundary):
         signed=self.bucket.create_signed_upload_url(path)
         return {'upload_url':signed['signed_url'],'method':'PUT','headers':{'Content-Type':f'multipart/form-data; boundary={boundary}'},'expires_at':datetime.now(timezone.utc)+timedelta(hours=2)}

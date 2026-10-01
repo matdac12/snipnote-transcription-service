@@ -26,12 +26,16 @@ class Repository:
         self.files[session['id']] = files
         return session
     def list_files(self, sid): return self.files[sid]
+    def mark_verified(self, sid, index):
+        self.files[sid][index]["verified_at"]=datetime.now(timezone.utc)
     def renew(self, sid, deadline):
         self.sessions[sid].update(status='awaiting_upload',upload_deadline=deadline)
         return self.sessions[sid]
 
 class Storage:
     fail = False
+    size = None
+    def size_of(self,path): return self.size
     def sign(self, path, content_type, boundary):
         if self.fail: raise RuntimeError('sensitive credential')
         return {'upload_url':'https://storage.invalid/signed','method':'PUT','headers':{'Content-Type':f'multipart/form-data; boundary={boundary}'},'expires_at':datetime.now(timezone.utc)+timedelta(hours=2)}
@@ -87,3 +91,8 @@ class UploadSessionTests(unittest.TestCase):
     def test_client_paths_nonfinite_and_bad_files_rejected(self):
         for changes in [dict(duration=float('nan')),dict(files=[]),dict(files=[dict(index=1,expected_bytes=50,duration=10,extension='m4a',content_type='audio/mp4')]),dict(files=[dict(index=0,expected_bytes=50,duration=10,extension='exe',content_type='audio/mp4')]),dict(path='foreign')]:
             with self.assertRaises(ValueError):UploadBootstrapRequest(**(self.request.model_dump()|changes))
+
+    def test_refresh_checks_existing_object_before_resigning(self):
+        a=self.bootstrap();self.storage.size=50
+        b=self.bootstrap()
+        self.assertTrue(b.files[0].verified);self.assertIsNone(b.files[0].upload_url)
