@@ -144,6 +144,11 @@ def chunk_audio(audio_bytes: bytes, filename: str, progress_callback: Optional[C
                 f"Created chunk {chunk_index + 1}/{estimated_chunks}"
             )
 
+        # The overlap may already include the complete recording. Do not submit
+        # that covered tail again as a separate, potentially sub-second chunk.
+        if chunk_end_with_overlap == duration_ms:
+            break
+
         # Move to next chunk (without overlap to avoid duplication)
         current_pos_ms = end_pos_ms
         chunk_index += 1

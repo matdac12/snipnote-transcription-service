@@ -391,3 +391,30 @@ fresh dump needs an unavailable DB password. No fresh backup is claimed.
 Physical-phone suspension/transcript evidence, shipped-app end-to-end smoke,
 long-job coexistence, independent review and wider release/merge remain pending.
 See the app verification report's approved owner trial section. No push or main merge.
+
+
+### Owner trial: redundant tail diagnosis (2026-10-01)
+
+The first physical upload completed and promoted correctly. The unchanged
+transcription worker split 477,119 ms of decoded audio into five normal chunks
+and a redundant 369 ms sixth chunk. Chunk five already covered the whole tail.
+Five chunks returned nonempty transcripts; the tail exhausted retries. A single
+owner-authorized diagnostic request reproduced HTTP 200 JSON with `text: ""`
+for that tail (no transcript or credentials logged). This is not a special-
+character rejection or an upstream HTTP 502. The existing validator synthesized
+502 for empty text. Partial successful text had not been persisted.
+
+Prepared fix: stop splitting once an exported overlapping chunk reaches the
+recording end. No audio is omitted; chunks extending beyond overlap are retained.
+Do not relax empty-response validation or switch providers. Real WAV/MP3
+regression reproduced two chunks instead of one before the fix, then passed.
+All 52 backend tests, including six disposable PostgreSQL tests, pass after fix
+(`/private/tmp/upload-tail-green.log`). An initial sandbox run could not reach
+local PostgreSQL; the authorized network rerun passed all checks.
+
+This change affects the existing transcription worker, which the upload rollout
+kept unchanged. Production deployment and retry of the failed owner job remain
+pending approval. Proposed rollout: deploy the reviewed feature revision, restart
+only the worker to load this fix, then retry the same failed job using its
+retained audio and provider. Do not create another meeting/upload/job or change
+transcription concurrency. Verify completion and owner transcript application.
