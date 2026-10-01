@@ -368,3 +368,26 @@ SwiftData store and production endpoints. Match version/build numbers in both
 bundles. The app report contains the focused physical-device matrix. The 7–10-day
 owner-only trial, App Store replacement/data continuity checks, wider activation
 and release remain owner actions after deployment/activation approvals.
+
+### Approved owner trial status — 2026-10-01
+
+Owner approved and confirmed backup readiness. Both named upload migrations applied,
+with history aligned to repository versions. API plus independent reconciler deployed;
+only the Auth-verified owner UUID is allowed. Current runtime code is `f328b6d`.
+Ordinary worker runtime/concurrency unchanged. Real signed multipart PUT, exact-size
+checks, wrong-size replacement, expiry renewal and feature-off existing-session
+refresh passed using incomplete disposable owner fixtures, with no paid job.
+
+Production proof exposed storage3 0.8.2's missing public signing-upsert option.
+`f328b6d` supplies documented `x-upsert=true` through its pinned request adapter only
+for unverified files; regression RED→GREEN and backend 50/50. Verified files never
+receive replacement credentials. Review this adapter on SDK upgrades.
+
+Rollback revision/env are private on omni under
+`/root/snipnote-rollbacks/background-upload-2026-10-01/`. Backup readiness was
+owner-confirmed; Management API listed no available backups/PITR restore points and
+fresh dump needs an unavailable DB password. No fresh backup is claimed.
+
+Physical-phone suspension/transcript evidence, shipped-app end-to-end smoke,
+long-job coexistence, independent review and wider release/merge remain pending.
+See the app verification report's approved owner trial section. No push or main merge.
