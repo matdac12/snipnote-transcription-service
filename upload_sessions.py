@@ -93,8 +93,12 @@ class SupabaseUploadStorage:
                 return int(size) if size is not None else None
         return None
     def sign(self,path,content_type,boundary):
-        signed=self.bucket.create_signed_upload_url(path)
-        return {'upload_url':signed['signed_url'],'method':'PUT','headers':{'Content-Type':f'multipart/form-data; boundary={boundary}'},'expires_at':datetime.now(timezone.utc)+timedelta(hours=2)}
+        # storage3 0.8.2 has no public upsert option for signed uploads. Use its
+        # pinned request adapter with the documented signing-time header. This
+        # is called only for unverified session files; verified files never sign.
+        response=self.bucket._request('POST',f'/object/upload/sign/{self.bucket._get_final_path(path)}',headers={'x-upsert':'true'})
+        signed_url=str(self.bucket._client.base_url)+response.json()['url']
+        return {'upload_url':signed_url,'method':'PUT','headers':{'Content-Type':f'multipart/form-data; boundary={boundary}'},'expires_at':datetime.now(timezone.utc)+timedelta(hours=2)}
 
 def service():
     from supabase_client import supabase

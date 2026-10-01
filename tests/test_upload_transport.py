@@ -22,3 +22,20 @@ class SignedTransportTests(unittest.TestCase):
         self.assertEqual(put.method,'PUT');self.assertIn('multipart/form-data; boundary=',put.headers['content-type'])
         self.assertIn(b'Content-Type: audio/mp4',put.content);self.assertIn(b'abc',put.content)
         self.assertEqual(signed['signed_url'],'https://storage.invalid/storage/v1//object/upload/sign/recordings/owner/test.m4a?token=opaque')
+
+    def test_existing_unverified_object_can_receive_replacement_credentials(self):
+        from types import SimpleNamespace
+        from storage3._sync.file_api import SyncBucketProxy
+        captured=[]
+        def handle(request):
+            captured.append(request)
+            if request.headers.get('x-upsert') != 'true':
+                return httpx.Response(400,json={'statusCode':400,'error':'Duplicate','message':'The resource already exists'})
+            return httpx.Response(200,json={'url':'/object/upload/sign/recordings/owner/test.m4a?token=opaque'})
+        http=httpx.Client(base_url='https://storage.invalid/storage/v1/',transport=httpx.MockTransport(handle))
+        bucket=SyncBucketProxy('recordings',http)
+        client=SimpleNamespace(storage=SimpleNamespace(from_=lambda name:bucket))
+        result=SupabaseUploadStorage(client).sign('owner/test.m4a','audio/mp4','snipnote-test')
+        self.assertEqual(captured[0].headers.get('x-upsert'),'true')
+        self.assertEqual(result['method'],'PUT')
+        self.assertIn('/object/upload/sign/recordings/owner/test.m4a?token=opaque',result['upload_url'])
