@@ -418,3 +418,25 @@ pending approval. Proposed rollout: deploy the reviewed feature revision, restar
 only the worker to load this fix, then retry the same failed job using its
 retained audio and provider. Do not create another meeting/upload/job or change
 transcription concurrency. Verify completion and owner transcript application.
+
+
+### Approved tail-fix deployment and same-job retry — 2026-10-01
+
+Owner explicitly approved deployment/retry and will repeat the physical test.
+Deployed service revision `62dd6f9f533448c6b9632e1f44fc9695695c5aaa` via
+Git bundle without push/merge. Retained prior runtime revision `f328b6d` in
+`/root/snipnote-rollbacks/background-upload-2026-10-01/before-tail-fix-revision`.
+Worker was idle before restart (four old processing rows were stale, not live
+work; they were untouched). Restarted only snipnote-worker, retaining max one
+concurrent job and 20-second poll interval. API/reconciler stayed running; no
+configuration, migration, dependency, provider or owner allowlist changes.
+
+Guarded update requeued the same failed owner job
+`17bef8f9-4fef-4bb6-b575-752c0bace00a`, resetting its exhausted retry counter.
+The existing audio/meeting/session/provider were reused. Runtime split now five
+chunks; completion observed at 08:55:28 UTC (10:55:28 Europe/Rome), retry count
+zero. Saved transcript 5,707 characters and summary 2,058 characters; one job
+exists for the meeting. All three services active and API healthy afterward.
+Only lengths/status were inspected, not user transcript text. Owner phone result
+application and a fresh background-upload trial remain pending. No app rebuild
+needed for this server fix; main and wider release remain untouched.
