@@ -173,3 +173,24 @@ async def transcribe(
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# New endpoints deliberately do not change legacy /jobs authentication/contracts.
+from upload_auth import verify_upload_user
+from upload_models import UploadBootstrapRequest, UploadSessionResponse
+from upload_sessions import bootstrap_upload, get_upload_session, background_upload_enabled
+from uuid import UUID
+
+def upload_identity(authorization: str | None = Header(default=None)) -> str:
+    return verify_upload_user(authorization)
+
+@app.get('/upload-capabilities')
+def upload_capabilities(user_id: str = Depends(upload_identity)):
+    return {'background_upload_enabled': background_upload_enabled(user_id)}
+
+@app.post('/upload-sessions', response_model=UploadSessionResponse, response_model_exclude_none=True)
+def create_upload_session(request: UploadBootstrapRequest, user_id: str = Depends(upload_identity)):
+    return bootstrap_upload(user_id, request)
+
+@app.get('/upload-sessions/{session_id}', response_model=UploadSessionResponse, response_model_exclude_none=True)
+def upload_session_status(session_id: UUID, user_id: str = Depends(upload_identity)):
+    return get_upload_session(user_id, str(session_id))
