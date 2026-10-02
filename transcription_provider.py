@@ -19,8 +19,11 @@ XAI_DEFAULT_CONFIG = {
 
 class TranscriptionProviderError(RuntimeError):
     """Sanitized, status-bearing error understood by the worker retry classifier."""
-    def __init__(self, message: str, status_code: Optional[int] = None):
+    def __init__(self, message: str, status_code: Optional[int] = None, retryable: Optional[bool] = None):
         self.status_code = status_code
+        self.retryable = retryable if retryable is not None else (
+            status_code is None or status_code in (408, 429) or status_code >= 500
+        )
         super().__init__(message)
 
 
@@ -40,7 +43,7 @@ def create_provider_transcription(
 
     key = os.getenv('XAI_API_KEY')
     if not key:
-        raise TranscriptionProviderError('xAI transcription is not configured')
+        raise TranscriptionProviderError('xAI transcription is not configured', retryable=False)
     config = get_task_config('transcription_xai', XAI_DEFAULT_CONFIG)
     filename = getattr(file, 'name', 'audio.m4a')
     mime_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
@@ -74,9 +77,20 @@ def create_provider_transcription(
             )
         try:
             output = response.json()
-            text = output.get('text') if isinstance(output, dict) else None
-            if not isinstance(text, str) or not text.strip():
-                raise ValueError('Invalid transcript')
         except (ValueError, TypeError):
-            raise TranscriptionProviderError('xAI transcription returned invalid text (HTTP 502)', 502) from None
+            raise TranscriptionProviderError(
+                f'xAI transcription returned invalid response: malformed JSON (HTTP {response.status_code})',
+                response.status_code, retryable=True,
+            ) from None
+        text = output.get('text') if isinstance(output, dict) else None
+        if not isinstance(text, str):
+            raise TranscriptionProviderError(
+                f'xAI transcription returned invalid response: missing or non-string text (HTTP {response.status_code})',
+                response.status_code, retryable=True,
+            )
+        # A successful empty string means the provider recognized no speech.
+        # Missing or non-string text remains an invalid response above.
+        if not text.strip():
+            print('   ℹ️ xAI returned HTTP 200 with no recognized speech')
+            return ''
         return text

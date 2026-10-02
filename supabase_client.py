@@ -18,6 +18,10 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 print(f"✅ Supabase client initialized for: {SUPABASE_URL}")
 
 
+class TranscriptionCancelled(RuntimeError):
+    retryable = False
+
+
 def create_job(
     user_id: str,
     meeting_id: str,
@@ -113,6 +117,13 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
         raise
 
 
+def get_latest_job_id(meeting_id: str) -> Optional[str]:
+    response = supabase.table("transcription_jobs").select("id").eq(
+        "meeting_id", meeting_id,
+    ).order("created_at", desc=True).order("id", desc=True).limit(1).execute()
+    return response.data[0]["id"] if response.data else None
+
+
 def update_job_status(
     job_id: str,
     status: str,
@@ -152,14 +163,14 @@ def update_job_status(
         if status == "completed":
             update_data["completed_at"] = datetime.utcnow().isoformat()
 
-        response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).execute()
+        response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).in_("status", ["pending", "processing"]).execute()
 
         if response.data and len(response.data) > 0:
             job = response.data[0]
             print(f"✅ Updated job {job_id} to status: {status}")
             return job
         else:
-            raise Exception(f"Failed to update job {job_id}: No data returned")
+            raise TranscriptionCancelled(f"Job {job_id} no longer active")
 
     except Exception as e:
         print(f"❌ Error updating job {job_id}: {e}")
@@ -191,12 +202,12 @@ def update_job_progress(
             "current_stage": stage
         }
 
-        response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).execute()
+        response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).in_("status", ["pending", "processing"]).execute()
 
         if response.data and len(response.data) > 0:
             return response.data[0]
         else:
-            raise Exception(f"Failed to update job {job_id} progress: No data returned")
+            raise TranscriptionCancelled(f"Job {job_id} no longer active")
 
     except Exception as e:
         print(f"❌ Error updating job {job_id} progress: {e}")
@@ -241,14 +252,14 @@ def update_job_with_results(
             "completed_at": datetime.utcnow().isoformat()
         }
 
-        response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).execute()
+        response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).in_("status", ["pending", "processing"]).execute()
 
         if response.data and len(response.data) > 0:
             job = response.data[0]
             print(f"✅ Updated job {job_id} with complete AI results")
             return job
         else:
-            raise Exception(f"Failed to update job {job_id}: No data returned")
+            raise TranscriptionCancelled(f"Job {job_id} no longer active")
 
     except Exception as e:
         print(f"❌ Error updating job {job_id} with results: {e}")
@@ -287,6 +298,13 @@ def get_audio_chunks(meeting_id: str) -> list[Dict[str, Any]]:
     except Exception as e:
         print(f"❌ Error fetching audio chunks for meeting {meeting_id}: {e}")
         raise
+
+
+def reset_chunk_transcripts(meeting_id: str):
+    """Start a new job without reusing another job's provider/language output."""
+    supabase.table("audio_chunks").update({
+        "transcribed": False, "transcript": None,
+    }).eq("meeting_id", meeting_id).execute()
 
 
 def update_chunk_transcript(chunk_id: str, transcript: str) -> Dict[str, Any]:
@@ -340,7 +358,7 @@ def update_chunks_processed(job_id: str, chunks_processed: int) -> Dict[str, Any
     try:
         update_data = {"chunks_processed": chunks_processed}
 
-        response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).execute()
+        response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).in_("status", ["pending", "processing"]).execute()
 
         if response.data and len(response.data) > 0:
             return response.data[0]
@@ -369,8 +387,8 @@ def increment_retry_count(job_id: str, error_message: str) -> Dict[str, Any]:
     try:
         # First get current retry count
         job = get_job(job_id)
-        if not job:
-            raise Exception(f"Job {job_id} not found")
+        if not job or job.get("status") not in ("pending", "processing"):
+            raise TranscriptionCancelled(f"Job {job_id} no longer active")
 
         current_retry = job.get("retry_count", 0) or 0
         new_retry_count = current_retry + 1
@@ -383,14 +401,14 @@ def increment_retry_count(job_id: str, error_message: str) -> Dict[str, Any]:
             "current_stage": f"Waiting for retry ({new_retry_count}/5)..."
         }
 
-        response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).execute()
+        response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).in_("status", ["pending", "processing"]).execute()
 
         if response.data and len(response.data) > 0:
             job = response.data[0]
             print(f"🔄 Job {job_id} queued for retry (attempt {new_retry_count}/5)")
             return job
         else:
-            raise Exception(f"Failed to increment retry count for job {job_id}: No data returned")
+            raise TranscriptionCancelled(f"Job {job_id} no longer active")
 
     except Exception as e:
         print(f"❌ Error incrementing retry count for job {job_id}: {e}")

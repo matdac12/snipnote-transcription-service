@@ -32,6 +32,8 @@ def retry_with_backoff(max_retries: int = 3, base_delay: float = 1.0):
                 try:
                     return func(*args, **kwargs)
                 except Exception as e:
+                    if getattr(e, 'retryable', True) is False:
+                        raise
                     last_exception = e
                     if attempt < max_retries - 1:
                         delay = base_delay * (2 ** attempt)
@@ -45,7 +47,7 @@ def retry_with_backoff(max_retries: int = 3, base_delay: float = 1.0):
 
 
 @retry_with_backoff(max_retries=3, base_delay=2.0)
-def transcribe_chunk_with_retry(chunk_bytes: bytes, chunk_name: str, language: Optional[str] = None, provider: str = "openai") -> str:
+def transcribe_chunk_with_retry(chunk_bytes: bytes, chunk_name: str, language: Optional[str] = None, provider: str = "openai", cancellation_check: Optional[Callable] = None) -> str:
     """
     Transcribe a single audio chunk with retry logic.
 
@@ -57,6 +59,8 @@ def transcribe_chunk_with_retry(chunk_bytes: bytes, chunk_name: str, language: O
     Returns:
         Transcript text
     """
+    if cancellation_check:
+        cancellation_check()
     chunk_file = io.BytesIO(chunk_bytes)
     chunk_file.name = chunk_name
 
@@ -208,7 +212,8 @@ def transcribe_audio(
     filename: str,
     progress_callback: Optional[Callable] = None,
     language: Optional[str] = None,
-    provider: str = "openai"
+    provider: str = "openai",
+    cancellation_check: Optional[Callable] = None
 ) -> dict:
     """
     Transcribe audio using the configured transcription model with automatic chunking for large files
@@ -234,7 +239,7 @@ def transcribe_audio(
             progress_callback(0, "Transcribing audio...")
 
         # Use retry-enabled transcription
-        transcript_text = transcribe_chunk_with_retry(audio_data, filename, language, provider)
+        transcript_text = transcribe_chunk_with_retry(audio_data, filename, language, provider, cancellation_check)
 
         # Calculate duration (rough estimate)
         duration = len(audio_data) / 32000
@@ -277,7 +282,8 @@ def transcribe_audio(
                     chunk_bytes,
                     f"chunk_{chunk_num}.mp3",
                     language,
-                    provider
+                    provider,
+                    cancellation_check
                 )
                 transcripts.append(transcript_text)
                 print(f"   ✅ Chunk {chunk_num} transcribed: {len(transcript_text)} chars")

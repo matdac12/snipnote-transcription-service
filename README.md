@@ -121,3 +121,23 @@ separately. Never store credentials in model rows or iOS. Follow the additive
 migration, credentials, backend, then iOS order in
 [DEPLOYMENT.md](DEPLOYMENT.md#saved-transcription-provider-release). Paid staging
 smoke tests and deployment remain separate from offline implementation tests.
+
+### Retry and cancellation behavior
+
+Successful xAI responses with an empty `text` are treated as no recognized
+speech for that segment. Missing/non-string text and malformed JSON remain errors;
+a completely empty meeting fails clearly without generating a summary. Provider
+HTTP errors retain their actual status, and permanent errors are not retried.
+
+Completed uploaded chunks are saved even when another chunk fails, and reused on
+job retry. A new job clears previous chunk transcripts so changing provider or
+language cannot reuse another job's output. Keep the production worker at one
+concurrent job (`MAX_CONCURRENT_JOBS=1`): chunk checkpoints are scoped by meeting.
+A newer job for the same meeting supersedes older queued/processing jobs, so
+older retries cannot consume the newer provider or language result.
+
+Deleting a meeting in the updated iOS app first marks its active cloud jobs as
+failed with `Cancelled by user`. Workers check job state before each provider
+request and condition updates on active status. An in-flight request can finish,
+but a cancelled/deleted job cannot be requeued or completed. No schema migration
+is required; existing ownership policies apply.

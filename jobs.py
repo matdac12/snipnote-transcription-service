@@ -14,12 +14,17 @@ from supabase_client import (
     update_job_with_results,
     update_job_progress,
     get_audio_chunks,
+    reset_chunk_transcripts,
+    get_job,
+    get_latest_job_id,
+    TranscriptionCancelled,
     update_chunk_transcript,
     update_chunks_processed,
     increment_retry_count
 )
 from transcribe import transcribe_audio
 from ai_config import create_response
+from transcription_provider import TranscriptionProviderError
 
 
 # Maximum retry attempts before permanent failure
@@ -29,6 +34,22 @@ MAX_RETRY_ATTEMPTS = 5
 # decoded chunk in memory, so this is the main lever on peak RAM — lower it on
 # small hosts (see MEMORY_OPTIMIZATION_PLAN.md).
 MAX_CHUNK_WORKERS = int(os.getenv("MAX_CHUNK_WORKERS", "5"))
+
+
+def ensure_job_active(job_id: str):
+    current = get_job(job_id)
+    if not current or current.get('status') not in ('pending', 'processing'):
+        raise TranscriptionCancelled('Transcription cancelled or no longer active')
+    # A rerun for this meeting supersedes older jobs, including queued retries.
+    # Otherwise an older retry could reuse the newer run's chunk checkpoints.
+    if current.get('meeting_id') and get_latest_job_id(current['meeting_id']) != job_id:
+        update_job_status(job_id, 'failed', error='Superseded by a newer transcription')
+        raise TranscriptionCancelled('Superseded by a newer transcription')
+
+
+def require_speech(transcript: str):
+    if not transcript.strip():
+        raise TranscriptionProviderError('No speech recognized in the recording', retryable=False)
 
 
 def is_retryable_error(error: Exception) -> bool:
@@ -53,6 +74,8 @@ def is_retryable_error(error: Exception) -> bool:
     Returns:
         True if the error is retryable, False if permanent
     """
+    if hasattr(error, 'retryable'):
+        return error.retryable
     error_str = str(error).lower()
 
     # Retryable patterns - transient issues that may resolve on retry
@@ -375,7 +398,7 @@ def download_chunk_from_storage(chunk_file_path: str) -> bytes:
         raise
 
 
-def process_single_chunk(chunk: Dict[str, Any], total_chunks: int, language: str = None, provider: str = "openai") -> Dict[str, Any]:
+def process_single_chunk(chunk: Dict[str, Any], total_chunks: int, language: str = None, provider: str = "openai", job_id: str = None, reuse_completed: bool = False) -> Dict[str, Any]:
     """
     Process a single audio chunk: download and transcribe.
     Used by ThreadPoolExecutor for parallel processing.
@@ -390,15 +413,24 @@ def process_single_chunk(chunk: Dict[str, Any], total_chunks: int, language: str
     """
     chunk_id = chunk["id"]
     chunk_index = chunk["chunk_index"]
-    file_path = chunk["file_path"]
-
     try:
+        if job_id:
+            ensure_job_active(job_id)
+        if reuse_completed and chunk.get('transcribed') and isinstance(chunk.get('transcript'), str):
+            print(f"   ♻️ Reusing completed chunk {chunk_index + 1}/{total_chunks}")
+            return {'chunk_id': chunk_id, 'chunk_index': chunk_index, 'transcript': chunk['transcript']}
+        file_path = chunk["file_path"]
         # Download chunk from storage
         chunk_data = download_chunk_from_storage(file_path)
 
         # Transcribe chunk
         print(f"   🎤 Transcribing chunk {chunk_index + 1}/{total_chunks}...")
-        result = transcribe_audio(chunk_data, f"chunk_{chunk_index}.m4a", language=language, provider=provider)
+        result = transcribe_audio(
+            chunk_data, f"chunk_{chunk_index}.m4a", language=language, provider=provider,
+            cancellation_check=(lambda: ensure_job_active(job_id)) if job_id else None,
+        )
+        if job_id:
+            ensure_job_active(job_id)
         transcript = result["transcript"]
 
         print(f"   ✅ Chunk {chunk_index + 1}/{total_chunks} transcribed ({len(transcript)} chars)")
@@ -427,6 +459,7 @@ def process_chunked_job(job: Dict[str, Any]):
     provider = job.get("transcription_provider", "openai")
 
     try:
+        ensure_job_active(job_id)
         # Step 1: Update status to 'processing'
         print(f"   📦 Processing chunked job ({total_chunks} chunks)...")
         update_job_status(job_id, "processing")
@@ -435,6 +468,8 @@ def process_chunked_job(job: Dict[str, Any]):
         # Step 2: Fetch all audio chunks from database
         print(f"   📋 Fetching audio chunks from database...")
         update_job_progress(job_id, 5, "Fetching audio chunks...")
+        if not job.get("retry_count"):
+            reset_chunk_transcripts(meeting_id)
         chunks = get_audio_chunks(meeting_id)
 
         if not chunks:
@@ -451,11 +486,12 @@ def process_chunked_job(job: Dict[str, Any]):
         # Track results by chunk_index to maintain order
         chunk_results: Dict[int, str] = {}
         completed_count = 0
+        chunk_errors = []
 
         with ThreadPoolExecutor(max_workers=MAX_CHUNK_WORKERS) as executor:
             # Submit all chunks for parallel processing
             future_to_chunk = {
-                executor.submit(process_single_chunk, chunk, len(chunks), language, provider): chunk
+                executor.submit(process_single_chunk, chunk, len(chunks), language, provider, job_id, bool(job.get("retry_count"))): chunk
                 for chunk in chunks
             }
 
@@ -468,6 +504,7 @@ def process_chunked_job(job: Dict[str, Any]):
                     chunk_index = result["chunk_index"]
                     transcript = result["transcript"]
 
+                    ensure_job_active(job_id)
                     # Save transcript to database
                     update_chunk_transcript(chunk_id, transcript)
 
@@ -487,8 +524,11 @@ def process_chunked_job(job: Dict[str, Any]):
                 except Exception as e:
                     chunk_index = chunk.get("chunk_index", "?")
                     print(f"   ❌ Chunk {chunk_index} failed: {e}")
-                    raise
+                    chunk_errors.append(e)
 
+        if chunk_errors:
+            raise chunk_errors[0]
+        ensure_job_active(job_id)
         # Build ordered transcripts list from results
         transcripts = [chunk_results[i] for i in sorted(chunk_results.keys())]
         print(f"   ✅ All {len(transcripts)} chunks transcribed in parallel")
@@ -498,6 +538,7 @@ def process_chunked_job(job: Dict[str, Any]):
         update_job_progress(job_id, 70, "Merging transcripts...")
         full_transcript = "\n".join(transcripts)
         print(f"   ✅ Merged transcript: {len(full_transcript)} chars")
+        require_speech(full_transcript)
 
         # Step 5: Generate AI content (70-90%)
 
@@ -528,6 +569,7 @@ def process_chunked_job(job: Dict[str, Any]):
         if not duration:
             duration = sum(chunk.get("duration_seconds", 0) for chunk in chunks)
 
+        ensure_job_active(job_id)
         update_job_with_results(
             job_id=job_id,
             transcript=full_transcript,
@@ -544,12 +586,16 @@ def process_chunked_job(job: Dict[str, Any]):
         print(f"   - Summary: {len(summary)} chars")
         print(f"   - Actions: {len(actions)} items")
 
+    except TranscriptionCancelled:
+        print(f"   ⏹️ Job {job_id} cancelled; no retry or result will be saved")
+        return
     except Exception as e:
         # Error handling: classify error and decide whether to retry or fail permanently
         error_message = str(e)
         retry_count = job.get("retry_count", 0) or 0
 
         try:
+            ensure_job_active(job_id)
             if is_retryable_error(e) and retry_count < MAX_RETRY_ATTEMPTS:
                 # Retryable error - queue for retry
                 print(f"🔄 Chunked job {job_id} failed with retryable error (attempt {retry_count + 1}/{MAX_RETRY_ATTEMPTS}): {error_message}")
@@ -563,9 +609,11 @@ def process_chunked_job(job: Dict[str, Any]):
                 else:
                     print(f"❌ Chunked job {job_id} failed with permanent error: {error_message}")
 
-                update_job_status(job_id=job_id, status="failed", error=error_message)
                 update_job_progress(job_id, 0, f"Failed: {error_message[:50]}...")
+                update_job_status(job_id=job_id, status="failed", error=error_message)
                 print(f"   💾 Error saved to database")
+        except TranscriptionCancelled:
+            print(f"   ⏹️ Job {job_id} cancelled; not requeued")
         except Exception as update_error:
             print(f"   ⚠️  Failed to update job status: {update_error}")
 
@@ -594,6 +642,7 @@ def process_job(job: Dict[str, Any]):
     provider = job.get("transcription_provider", "openai")
 
     try:
+        ensure_job_active(job_id)
         # Step 1: Update status to 'processing' and set initial progress
         print(f"   ⚙️  Updating status to 'processing'...")
         update_job_status(job_id, "processing")
@@ -610,6 +659,7 @@ def process_job(job: Dict[str, Any]):
 
         def transcription_progress(pct: float, stage: str):
             """Callback to report transcription progress (maps 0-100 to 10-60)"""
+            ensure_job_active(job_id)
             adjusted_pct = 10 + int(pct * 0.5)  # Scale to 10-60% range
             update_job_progress(job_id, adjusted_pct, stage)
 
@@ -618,10 +668,13 @@ def process_job(job: Dict[str, Any]):
             "audio.m4a",
             progress_callback=transcription_progress,
             language=language,
-            provider=provider
+            provider=provider,
+            cancellation_check=lambda: ensure_job_active(job_id)
         )
 
         transcript = result["transcript"]
+        ensure_job_active(job_id)
+        require_speech(transcript)
         duration = result["duration"]
 
         print(f"   ✅ Transcription complete: {len(transcript)} chars, {duration:.1f}s")
@@ -650,6 +703,7 @@ def process_job(job: Dict[str, Any]):
         print(f"   💾 Saving all results to database...")
         update_job_progress(job_id, 95, "Saving results...")
 
+        ensure_job_active(job_id)
         update_job_with_results(
             job_id=job_id,
             transcript=transcript,
@@ -666,12 +720,16 @@ def process_job(job: Dict[str, Any]):
         print(f"   - Summary: {len(summary)} chars")
         print(f"   - Actions: {len(actions)} items")
 
+    except TranscriptionCancelled:
+        print(f"   ⏹️ Job {job_id} cancelled; no retry or result will be saved")
+        return
     except Exception as e:
         # Error handling: classify error and decide whether to retry or fail permanently
         error_message = str(e)
         retry_count = job.get("retry_count", 0) or 0
 
         try:
+            ensure_job_active(job_id)
             if is_retryable_error(e) and retry_count < MAX_RETRY_ATTEMPTS:
                 # Retryable error - queue for retry
                 print(f"🔄 Job {job_id} failed with retryable error (attempt {retry_count + 1}/{MAX_RETRY_ATTEMPTS}): {error_message}")
@@ -685,13 +743,15 @@ def process_job(job: Dict[str, Any]):
                 else:
                     print(f"❌ Job {job_id} failed with permanent error: {error_message}")
 
+                update_job_progress(job_id, 0, f"Failed: {error_message[:50]}...")
                 update_job_status(
                     job_id=job_id,
                     status="failed",
                     error=error_message
                 )
-                update_job_progress(job_id, 0, f"Failed: {error_message[:50]}...")
                 print(f"   💾 Error saved to database")
+        except TranscriptionCancelled:
+            print(f"   ⏹️ Job {job_id} cancelled; not requeued")
         except Exception as update_error:
             print(f"   ⚠️  Failed to update job status: {update_error}")
 

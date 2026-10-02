@@ -90,11 +90,37 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.client.audio.transcriptions.create.assert_not_called()
 
-    def test_xai_rejects_malformed_or_blank_text(self):
-        for value in [{}, {'text': '  '}, {'text': 4}, [], 'invalid']:
+    def test_xai_rejects_missing_or_non_string_text(self):
+        for value in [{}, {'text': 4}, [], 'invalid']:
             self.calls.clear()
-            with self.assertRaisesRegex(Exception, '502'):
+            with self.assertRaisesRegex(Exception, 'invalid response.*HTTP 200'):
                 self.send(outputs=[value])
+
+    def test_successful_empty_xai_result_does_not_restart_audio(self):
+        self.assertEqual(self.send(outputs=[{'text': '', 'language': '', 'duration': 98.016}]), '')
+        self.assertEqual(len(self.calls), 1)
+
+    def test_blank_xai_result_is_normalized(self):
+        self.assertEqual(self.send(outputs=[{'text': '  ', 'duration': 2.0}]), '')
+
+    def test_permanent_xai_error_is_not_retried(self):
+        from transcription_provider import TranscriptionProviderError
+        with patch.object(transcribe, 'create_provider_transcription', side_effect=TranscriptionProviderError('HTTP 401', 401)) as create, patch.object(transcribe.time, 'sleep') as sleep:
+            with self.assertRaises(TranscriptionProviderError):
+                transcribe.transcribe_chunk_with_retry(b'audio', 'chunk.mp3', provider='xai')
+            self.assertEqual(create.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_cancellation_stops_before_next_internal_chunk(self):
+        from jobs import TranscriptionCancelled
+        checks = iter([None, TranscriptionCancelled('cancelled')])
+        def check():
+            result = next(checks)
+            if result: raise result
+        with patch.object(transcribe, 'chunk_audio', return_value=[b'one', b'two']), patch.object(transcribe, 'create_provider_transcription', return_value='first') as create:
+            with self.assertRaisesRegex(RuntimeError, 'cancelled'):
+                transcribe.transcribe_audio(b'x' * (transcribe.MAX_CHUNK_SIZE_BYTES + 1), 'meeting.m4a', provider='xai', cancellation_check=check)
+            self.assertEqual(create.call_count, 1)
 
     def test_all_internal_chunks_keep_provider(self):
         providers = []
