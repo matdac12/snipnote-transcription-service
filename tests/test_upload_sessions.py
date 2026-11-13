@@ -33,6 +33,11 @@ class Repository:
     def renew(self, sid, deadline):
         self.sessions[sid].update(status='awaiting_upload',upload_deadline=deadline)
         return self.sessions[sid]
+    def get_job(self, job_id):
+        return getattr(self, 'jobs', {}).get(job_id)
+    def requeue_failed_job(self, job_id):
+        job = self.jobs[job_id]
+        job.update(status='pending', retry_count=0, error_message=None)
 
 class Storage:
     fail = False
@@ -93,6 +98,30 @@ class UploadSessionTests(unittest.TestCase):
     def test_client_paths_nonfinite_and_bad_files_rejected(self):
         for changes in [dict(duration=float('nan')),dict(files=[]),dict(files=[dict(index=1,expected_bytes=50,duration=10,extension='m4a',content_type='audio/mp4')]),dict(files=[dict(index=0,expected_bytes=50,duration=10,extension='exe',content_type='audio/mp4')]),dict(path='foreign')]:
             with self.assertRaises(ValueError):UploadBootstrapRequest(**(self.request.model_dump()|changes))
+
+    def test_failed_speaker_job_can_be_requeued_and_a_live_job_cannot(self):
+        failed = str(uuid4())
+        live = str(uuid4())
+        self.repo.jobs = {
+            failed: dict(id=failed, user_id=OWNER, meeting_id=MEETING, status='failed', retry_count=5, error_message='no speaker'),
+            live: dict(id=live, user_id=OWNER, meeting_id=MEETING, status='processing', retry_count=0, error_message=None),
+        }
+        self.assertEqual(self.service.retry_failed_upload(OWNER, failed)['status'], 'pending')
+        self.assertEqual(self.repo.jobs[failed]['status'], 'pending')
+        self.assertEqual(self.repo.jobs[failed]['retry_count'], 0)
+        self.assertIsNone(self.repo.jobs[failed]['error_message'])
+        with self.assertRaises(HTTPException) as busy:
+            self.service.retry_failed_upload(OWNER, live)
+        self.assertEqual(busy.exception.status_code, 409)
+        self.assertEqual(self.repo.jobs[live]['status'], 'processing')
+        with self.assertRaises(HTTPException) as missing:
+            self.service.retry_failed_upload(str(uuid4()), failed)
+        self.assertEqual(missing.exception.status_code, 404)
+        pending = str(uuid4())
+        self.repo.jobs[pending] = dict(id=pending, user_id=OWNER, meeting_id=MEETING, status='pending', retry_count=2, error_message='keep')
+        self.assertEqual(self.service.retry_failed_upload(OWNER, pending)['status'], 'pending')
+        self.assertEqual(self.repo.jobs[pending]['retry_count'], 2)
+        self.assertEqual(self.repo.jobs[pending]['error_message'], 'keep')
 
     def test_pre_update_session_refreshes_and_still_rejects_a_real_change(self):
         payload = self.request.model_dump(mode='json')

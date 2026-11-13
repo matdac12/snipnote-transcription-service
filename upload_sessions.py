@@ -44,6 +44,20 @@ class UploadSessions:
         if session['status']=='expired' or (session['status']=='awaiting_upload' and utc(session['upload_deadline'])<=datetime.now(timezone.utc)):
             session=self.repo.renew(session['id'],(datetime.now(timezone.utc)+timedelta(hours=24)).isoformat())
         return self.response(session,sign=True)
+    def retry_failed_upload(self, user_id, job_id):
+        """Queue a failed job again. The audio is already stored, so this does not open a second session."""
+        user_id = str(UUID(user_id))
+        job_id = str(UUID(job_id))
+        job = self.repo.get_job(job_id)
+        if not job or job['user_id'] != user_id or not self.repo.owns_meeting(user_id, job['meeting_id']):
+            raise HTTPException(404, detail={'code': 'job_not_found'})
+        # Already waiting for the worker. A second tap must not reset its retry count.
+        if job['status'] == 'pending':
+            return {'job_id': job_id, 'status': 'pending'}
+        if job['status'] != 'failed':
+            raise HTTPException(409, detail={'code': 'job_not_failed'})
+        self.repo.requeue_failed_job(job_id)
+        return {'job_id': job_id, 'status': 'pending'}
     def get_upload_session(self,user_id,session_id):
         session=self.repo.get(str(UUID(session_id)))
         if not session or session['user_id'] != user_id or not self.repo.owns_meeting(user_id,session['meeting_id']): raise HTTPException(404,detail={'code':'session_not_found'})
@@ -87,6 +101,16 @@ class SupabaseUploadRepository:
         return self.client.table('background_upload_files').select('*').eq('session_id',sid).order('index').execute().data
     def mark_verified(self,sid,index):
         self.client.table("background_upload_files").update({"verified_at":datetime.now(timezone.utc).isoformat()}).eq("session_id",sid).eq("index",index).execute()
+    def get_job(self, job_id):
+        data = self.client.table('transcription_jobs').select('*').eq('id', job_id).execute().data
+        return data[0] if data else None
+    def requeue_failed_job(self, job_id):
+        updated = self.client.table('transcription_jobs').update({
+            'status': 'pending', 'retry_count': 0, 'error_message': None,
+            'progress_percentage': 0, 'current_stage': 'Waiting to transcribe',
+        }).eq('id', job_id).eq('status', 'failed').execute()
+        if not updated.data:
+            raise HTTPException(409, detail={'code': 'job_not_failed'})
     def renew(self,sid,deadline):
         # Status predicate prevents refresh racing promotion from regressing queued.
         self.client.table('background_upload_sessions').update({'status':'awaiting_upload','upload_deadline':deadline,'updated_at':datetime.now(timezone.utc).isoformat()}).eq('id',sid).in_('status',['expired','awaiting_upload']).execute()
@@ -114,4 +138,5 @@ def service():
     from supabase_client import supabase
     return UploadSessions(SupabaseUploadRepository(supabase),SupabaseUploadStorage(supabase))
 def bootstrap_upload(user_id,request):return service().bootstrap_upload(user_id,request)
+def retry_failed_upload(user_id,job_id):return service().retry_failed_upload(user_id,job_id)
 def get_upload_session(user_id,session_id):return service().get_upload_session(user_id,session_id)

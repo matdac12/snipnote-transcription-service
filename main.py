@@ -179,7 +179,7 @@ async def transcribe(
 # New endpoints deliberately do not change legacy /jobs authentication/contracts.
 from upload_auth import verify_upload_user
 from upload_models import UploadBootstrapRequest, UploadSessionResponse
-from upload_sessions import bootstrap_upload, get_upload_session, background_upload_enabled
+from upload_sessions import bootstrap_upload, get_upload_session, background_upload_enabled, retry_failed_upload
 from uuid import UUID
 
 def upload_identity(authorization: str | None = Header(default=None)) -> str:
@@ -217,6 +217,10 @@ def upload_capabilities(user_id: str = Depends(upload_identity)):
 @app.post('/upload-sessions', response_model=UploadSessionResponse, response_model_exclude_none=True)
 def create_upload_session(request: UploadBootstrapRequest, user_id: str = Depends(upload_identity)):
     return bootstrap_upload(user_id, request)
+
+@app.post('/jobs/{job_id}/retry')
+def retry_failed_transcription_job(job_id: UUID, user_id: str = Depends(upload_identity)):
+    return retry_failed_upload(user_id, str(job_id))
 
 @app.get('/upload-sessions/{session_id}', response_model=UploadSessionResponse, response_model_exclude_none=True)
 def upload_session_status(session_id: UUID, user_id: str = Depends(upload_identity)):
