@@ -14,6 +14,14 @@ def background_upload_enabled(user_id):
 def utc(value):
     return value if isinstance(value,datetime) else datetime.fromisoformat(value.replace('Z','+00:00'))
 
+def manifest_digest(request):
+    """Hash the bootstrap manifest. A false speaker flag is omitted so a session
+    stored before that field existed still matches the same non-speaker upload."""
+    payload = request.model_dump(mode='json')
+    if payload.get('speaker_labels') is False:
+        payload.pop('speaker_labels', None)
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
 class UploadSessions:
     def __init__(self, repository, storage, enabled=background_upload_enabled):
         self.repo, self.storage, self.enabled = repository, storage, enabled
@@ -23,7 +31,7 @@ class UploadSessions:
             raise HTTPException(400, detail={'code': 'speaker_labels_require_one_xai_file'})
         # Verify meeting existence and ownership even for refresh, before signing.
         if not self.repo.owns_meeting(user_id,meeting_id): raise HTTPException(404,detail={'code':'meeting_not_found'})
-        digest=hashlib.sha256(json.dumps(request.model_dump(mode='json'),sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        digest=manifest_digest(request)
         session=self.repo.find(user_id,meeting_id)
         if session is None:
             if not self.enabled(user_id): raise HTTPException(403,detail={'code':'background_upload_disabled'})

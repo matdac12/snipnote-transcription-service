@@ -1,4 +1,6 @@
 """Catches duplicate sessions, gate bypasses, manifest drift and credential leaks."""
+import hashlib
+import json
 import unittest
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
@@ -91,6 +93,24 @@ class UploadSessionTests(unittest.TestCase):
     def test_client_paths_nonfinite_and_bad_files_rejected(self):
         for changes in [dict(duration=float('nan')),dict(files=[]),dict(files=[dict(index=1,expected_bytes=50,duration=10,extension='m4a',content_type='audio/mp4')]),dict(files=[dict(index=0,expected_bytes=50,duration=10,extension='exe',content_type='audio/mp4')]),dict(path='foreign')]:
             with self.assertRaises(ValueError):UploadBootstrapRequest(**(self.request.model_dump()|changes))
+
+    def test_pre_update_session_refreshes_and_still_rejects_a_real_change(self):
+        payload = self.request.model_dump(mode='json')
+        payload.pop('speaker_labels', None)
+        old = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        sid = str(uuid4())
+        self.repo.sessions[sid] = dict(id=sid, user_id=OWNER, meeting_id=MEETING, reserved_job_id=str(uuid4()), manifest_digest=old, transcription_provider='xai', language='it', duration=10, speaker_labels=False, status='awaiting_upload', upload_deadline=(datetime.now(timezone.utc) + timedelta(hours=24)).isoformat())
+        self.repo.files[sid] = [dict(session_id=sid, index=0, path='p', expected_bytes=50, duration=10, content_type='audio/mp4', verified_at=None)]
+        self.assertEqual(str(self.bootstrap().session_id), sid)
+        self.request.language = 'en'
+        with self.assertRaises(HTTPException) as changed:
+            self.bootstrap()
+        self.assertEqual(changed.exception.status_code, 409)
+        self.request.language = 'it'
+        self.request.speaker_labels = True
+        with self.assertRaises(HTTPException) as speakers:
+            self.bootstrap()
+        self.assertEqual(speakers.exception.status_code, 409)
 
     def test_register_payload_includes_speaker_labels(self):
         self.request = UploadBootstrapRequest(meeting_id=MEETING, transcription_provider='xai', language='it', duration=10, speaker_labels=True, files=[dict(index=0, expected_bytes=524288000, duration=10, extension='m4a', content_type='audio/mp4')])
