@@ -39,6 +39,14 @@ TRANSCRIPTION_DEFAULT_CONFIG: Dict[str, Any] = {
     "verbosity": None,
     "fallback_model": "gpt-4o-transcribe",
 }
+# No fallback model: a rejected cleanup model keeps the raw transcript.
+# Luna was measured to change meaning, so it is not a silent substitute.
+CLEANUP_DEFAULT_CONFIG: Dict[str, Any] = {
+    "model": "gpt-6.1-terra",
+    "reasoning_effort": "medium",
+    "verbosity": None,
+    "fallback_model": None,
+}
 
 _cache: Dict[str, Dict[str, Any]] = {}
 _cache_loaded_at: float = float("-inf")  # monotonic() can be < TTL right after boot
@@ -93,14 +101,18 @@ def create_response(
     task: str,
     input: list,
     default_verbosity: Optional[str] = None,
+    defaults: Optional[Dict[str, Any]] = None,
+    text_format: Optional[Dict[str, Any]] = None,
 ):
     """
     Call the Responses API with the model/effort/verbosity configured for `task`.
 
     `default_verbosity` is used when the task's row leaves verbosity NULL.
     A NULL reasoning_effort omits `reasoning` (for models without reasoning support).
+    `defaults` replaces DEFAULT_CONFIG when the task has no row.
+    `text_format` is a Responses `text.format` value, such as a JSON schema.
     """
-    config = get_task_config(task)
+    config = get_task_config(task, defaults or DEFAULT_CONFIG)
     effort = config["reasoning_effort"]
     verbosity = config["verbosity"] or default_verbosity
 
@@ -108,23 +120,59 @@ def create_response(
         kwargs: Dict[str, Any] = {"model": model, "input": input}
         if effort:
             kwargs["reasoning"] = {"effort": effort}
+        text: Dict[str, Any] = {}
         if verbosity:
-            kwargs["text"] = {"verbosity": verbosity}
+            text["verbosity"] = verbosity
+        if text_format:
+            text["format"] = text_format
+        if text:
+            kwargs["text"] = text
         print(f"   🤖 {task}: model={model} effort={effort}")
         return client.responses.create(**kwargs)
 
     return _call_with_fallback(task, config, call)
 
 
-def create_transcription(client: OpenAI, file: io.BytesIO, language: Optional[str] = None) -> str:
+def _accepts_keywords(model: str) -> bool:
+    return model == "gpt-transcribe" or model.startswith("gpt-transcribe-")
+
+
+def _prompt_for(terms: list[str]) -> str:
+    """A short prompt for models that have no keywords field."""
+    kept = []
+    size = len("Terms that may be spoken: ")
+    for term in terms:
+        if size + len(term) + 2 > 700:
+            break
+        kept.append(term)
+        size += len(term) + 2
+    return "Terms that may be spoken: " + ", ".join(kept)
+
+
+def create_transcription(
+    client: OpenAI,
+    file: io.BytesIO,
+    language: Optional[str] = None,
+    keywords: Optional[list[str]] = None,
+) -> str:
     """Transcribe `file` with the model configured for the 'transcription' task."""
     config = get_task_config("transcription", TRANSCRIPTION_DEFAULT_CONFIG)
+    hints = list(keywords or [])
 
     def call(model: str) -> str:
         file.seek(0)
         kwargs: Dict[str, Any] = {"model": model, "file": file}
-        if language:
-            kwargs["language"] = language
+        if _accepts_keywords(model):
+            # gpt-transcribe takes `languages`, and rejects a paired `language`.
+            if language:
+                kwargs["languages"] = [language]
+            if hints:
+                kwargs["keywords"] = hints
+        else:
+            if language:
+                kwargs["language"] = language
+            if hints:
+                kwargs["prompt"] = _prompt_for(hints)
         return client.audio.transcriptions.create(**kwargs).text
 
     return _call_with_fallback("transcription", config, call)

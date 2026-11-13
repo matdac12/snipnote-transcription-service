@@ -60,6 +60,47 @@ class ProviderTests(unittest.TestCase):
         self.client.audio.transcriptions.create.return_value.text = 'OpenAI transcript'
         self.assertEqual(create_provider_transcription(self.client, self.file), 'OpenAI transcript')
         self.assertEqual(self.client.audio.transcriptions.create.call_args.kwargs['model'], 'configured-gpt')
+        self.assertNotIn('keywords', self.client.audio.transcriptions.create.call_args.kwargs)
+
+    def test_personal_vocabulary_is_attached_for_the_matching_user(self):
+        from vocabulary import terms_for_user
+        user = 'e6658fad-05e2-4d25-9779-857bc72bbc81'
+        terms = terms_for_user(user)
+        self.config.update(task='transcription', model='gpt-transcribe')
+        self.client.audio.transcriptions.create.return_value.text = 'OpenAI transcript'
+        self.assertEqual(create_provider_transcription(self.client, self.file, 'it', 'openai', user), 'OpenAI transcript')
+        kwargs = self.client.audio.transcriptions.create.call_args.kwargs
+        self.assertEqual(kwargs['keywords'], terms)
+        self.assertEqual(kwargs['languages'], ['it'])
+        self.assertNotIn('language', kwargs)
+        self.assertIn('JGalileo', terms)
+        self.assertNotIn('senza biologiche', terms)
+        self.assertLessEqual(len(terms), 100)
+
+    def test_xai_receives_personal_keyterms_before_the_file(self):
+        user = 'e6658fad-05e2-4d25-9779-857bc72bbc81'
+        self.send(language='it', provider='xai')
+        # The helper above does not pass user_id. Call directly.
+        self.calls.clear()
+        def handle(request):
+            self.calls.append(request)
+            return httpx.Response(200, json={'text': 'Meeting transcript'})
+        http = httpx.Client(transport=httpx.MockTransport(handle))
+        with patch('transcription_provider.httpx.Client', return_value=http):
+            create_provider_transcription(self.client, self.file, 'it', 'xai', user)
+        body = self.calls[0].content
+        self.assertIn(b'name="keyterm"\r\n\r\nJGalileo', body)
+        self.assertIn(b'name="keyterm"\r\n\r\nScienze Biologiche', body)
+        self.assertLess(body.index(b'name="keyterm"'), body.index(b'name="file"'))
+        self.assertNotIn(b'senza biologiche', body)
+
+    def test_another_user_gets_no_vocabulary(self):
+        self.config.update(task='transcription', model='gpt-transcribe')
+        self.client.audio.transcriptions.create.return_value.text = 'OpenAI transcript'
+        create_provider_transcription(self.client, self.file, 'it', 'openai', 'someone-else')
+        kwargs = self.client.audio.transcriptions.create.call_args.kwargs
+        self.assertNotIn('keywords', kwargs)
+        self.assertEqual(kwargs['languages'], ['it'])
 
     def test_missing_xai_key_never_calls_openai(self):
         with patch.dict(os.environ, {'XAI_API_KEY': ''}):
@@ -124,7 +165,7 @@ class ProviderTests(unittest.TestCase):
 
     def test_all_internal_chunks_keep_provider(self):
         providers = []
-        def create(_client, file, language=None, provider='openai'):
+        def create(_client, file, language=None, provider='openai', user_id=None):
             providers.append(provider)
             return 'chunk transcript'
         with patch.object(transcribe, 'chunk_audio', return_value=[b'one', b'two']), patch.object(transcribe, 'create_provider_transcription', side_effect=create):

@@ -214,56 +214,62 @@ def update_job_progress(
         raise
 
 
+def _missing_raw_transcript_column(error: Exception) -> bool:
+    message = str(error).lower()
+    return "raw_transcript" in message and (
+        "pgrst204" in message or "schema cache" in message or "does not exist" in message
+    )
+
+
 def update_job_with_results(
     job_id: str,
     transcript: str,
     overview: str,
     summary: str,
     actions: list,
-    duration: float
+    duration: float,
+    raw_transcript: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Update job with all AI-generated results
+    Update job with all AI-generated results.
 
-    Args:
-        job_id: UUID of the job to update
-        transcript: Full meeting transcript
-        overview: 1-sentence overview
-        summary: Comprehensive meeting summary
-        actions: List of action items
-        duration: Audio duration in seconds
-
-    Returns:
-        Dict containing updated job data
-
-    Raises:
-        Exception: If update fails
+    `transcript` is the reader-facing text. `raw_transcript` is the speech-to-text
+    output and is omitted when the column is not in the database yet.
     """
+    update_data = {
+        "status": "completed",
+        "transcript": transcript,
+        "overview": overview,
+        "summary": summary,
+        "actions": actions,  # Supabase client handles JSONB conversion automatically
+        "duration": duration,
+        "progress_percentage": 100,  # Mark as 100% complete
+        "current_stage": "Complete",
+        "completed_at": datetime.utcnow().isoformat()
+    }
+    if raw_transcript is not None:
+        update_data["raw_transcript"] = raw_transcript
+
     try:
-        update_data = {
-            "status": "completed",
-            "transcript": transcript,
-            "overview": overview,
-            "summary": summary,
-            "actions": actions,  # Supabase client handles JSONB conversion automatically
-            "duration": duration,
-            "progress_percentage": 100,  # Mark as 100% complete
-            "current_stage": "Complete",
-            "completed_at": datetime.utcnow().isoformat()
-        }
-
-        response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).in_("status", ["pending", "processing"]).execute()
-
-        if response.data and len(response.data) > 0:
-            job = response.data[0]
-            print(f"✅ Updated job {job_id} with complete AI results")
-            return job
-        else:
-            raise TranscriptionCancelled(f"Job {job_id} no longer active")
-
-    except Exception as e:
-        print(f"❌ Error updating job {job_id} with results: {e}")
+        return _write_job_results(job_id, update_data)
+    except TranscriptionCancelled:
         raise
+    except Exception as error:
+        if "raw_transcript" in update_data and _missing_raw_transcript_column(error):
+            print("   ⚠️ raw_transcript column is missing; saving the reader transcript only")
+            update_data.pop("raw_transcript")
+            return _write_job_results(job_id, update_data)
+        print(f"❌ Error updating job {job_id} with results: {error}")
+        raise
+
+
+def _write_job_results(job_id: str, update_data: Dict[str, Any]) -> Dict[str, Any]:
+    response = supabase.table("transcription_jobs").update(update_data).eq("id", job_id).in_("status", ["pending", "processing"]).execute()
+
+    if response.data and len(response.data) > 0:
+        print(f"✅ Updated job {job_id} with complete AI results")
+        return response.data[0]
+    raise TranscriptionCancelled(f"Job {job_id} no longer active")
 
 
 def get_audio_chunks(meeting_id: str) -> list[Dict[str, Any]]:

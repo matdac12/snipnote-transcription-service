@@ -62,6 +62,7 @@ class JobStatusResponse(BaseModel):
     audio_url: str | None = None      # Optional for chunked jobs
     status: str
     transcript: str | None = None
+    raw_transcript: str | None = None  # Speech-to-text output, before reader cleanup
     overview: str | None = None      # AI-generated 1-sentence overview
     summary: str | None = None        # AI-generated full summary
     actions: list | None = None       # AI-extracted action items

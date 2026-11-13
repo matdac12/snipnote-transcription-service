@@ -8,6 +8,7 @@ import httpx
 from openai import OpenAI
 
 from ai_config import create_transcription, get_task_config
+from vocabulary import terms_for_user
 
 XAI_DEFAULT_CONFIG = {
     'model': 'grok-voice-transcribe-2.0',
@@ -36,10 +37,12 @@ def validate_transcription_provider(provider: str) -> str:
 def create_provider_transcription(
     client: OpenAI, file: io.BytesIO,
     language: Optional[str] = None, provider: str = 'openai',
+    user_id: Optional[str] = None,
 ) -> str:
     validate_transcription_provider(provider)
+    terms = terms_for_user(user_id)
     if provider == 'openai':
-        return create_transcription(client, file, language)
+        return create_transcription(client, file, language, keywords=terms)
 
     key = os.getenv('XAI_API_KEY')
     if not key:
@@ -50,9 +53,12 @@ def create_provider_transcription(
 
     def call(http: httpx.Client, model: str) -> httpx.Response:
         file.seek(0)
+        # A list value repeats the field. Keyterms stay ahead of the file.
         options = {'model': model}
         if language:
             options.update(language=language, format='true')
+        if terms:
+            options['keyterm'] = terms
         try:
             # httpx encodes data fields before files. Rebuild for every attempt.
             return http.post(

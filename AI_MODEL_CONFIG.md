@@ -14,7 +14,7 @@ switches the model for both short (on-device) and long (VPS) meetings.
 
 | Column | Meaning |
 |---|---|
-| `task` | `transcription`, `transcription_xai`, `overview`, `summary`, `actions` (used here); iOS also uses `title`, `text_summary`, `eve_chat`, `actions_report` |
+| `task` | `transcription`, `transcription_xai`, `transcript_cleanup`, `overview`, `summary`, `actions` (used here); iOS also uses `title`, `text_summary`, `eve_chat`, `actions_report` |
 | `model` | Provider-specific model ID, e.g. `gpt-6-luna` |
 | `reasoning_effort` | e.g. `none`, `low`, `medium`, `high`. NULL sends no `reasoning` parameter (for models without reasoning). Note: `minimal` is rejected by GPT-6 models. |
 | `verbosity` | `low`, `medium` or `high`. NULL uses the code default (`low` for overview and summary, unset for actions). |
@@ -29,6 +29,12 @@ switches the model for both short (on-device) and long (VPS) meetings.
 - The `transcription` row (seeded `gpt-transcribe`, fallback `gpt-4o-transcribe`) uses only
   `model` and `fallback_model`. `TRANSCRIPTION_MODEL` in `/etc/snipnote-transcription/env`
   is now only the default for when the table can't be read or has no `transcription` row.
+- The `transcript_cleanup` row (seeded `gpt-6.1-terra`, effort `medium`, no fallback)
+  cleans the transcript people read, after the summary has been generated from the
+  raw text. The worker saves that cleaned text in `transcript` and the original in
+  `raw_transcript`. A failed cleanup, or a model OpenAI rejects, keeps the raw text
+  and the job still completes. Meetings of 5 minutes or less, and local-mode
+  meetings, are transcribed in the app and are not cleaned here.
 
 ---
 

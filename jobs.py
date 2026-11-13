@@ -24,6 +24,8 @@ from supabase_client import (
 )
 from transcribe import transcribe_audio
 from ai_config import create_response
+from transcript_cleanup import clean_transcript
+from vocabulary import entries_for_user
 from transcription_provider import TranscriptionProviderError
 
 
@@ -371,6 +373,30 @@ Meeting Summary: {summary}"""
         return []
 
 
+def prepare_reader_transcript(transcript: str, language: str | None, summary: str, user_id: str | None = None) -> str:
+    """Clean the transcript people read. A cleanup failure keeps the raw words."""
+    try:
+        cleaned = clean_transcript(
+            transcript, language, summary, openai_client, vocabulary=entries_for_user(user_id),
+        )
+    except Exception as error:
+        print(f"   ⚠️ Transcript cleanup failed, keeping the raw transcript: {error}")
+        return transcript
+    if not cleaned.strip():
+        return transcript
+    return cleaned
+
+
+def derive_reader_results(transcript: str, language: str | None, summary: str, user_id: str | None = None):
+    """Overview, actions, and the reader transcript. The summary was built from the raw transcript."""
+    print("   🚀 Generating overview, actions, and transcript cleanup in parallel...")
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        overview_future = executor.submit(generate_overview, summary)
+        actions_future = executor.submit(extract_actions, summary)
+        clean_future = executor.submit(prepare_reader_transcript, transcript, language, summary, user_id)
+        return overview_future.result(), actions_future.result(), clean_future.result()
+
+
 def download_chunk_from_storage(chunk_file_path: str) -> bytes:
     """
     Download a single chunk from Supabase Storage
@@ -398,7 +424,7 @@ def download_chunk_from_storage(chunk_file_path: str) -> bytes:
         raise
 
 
-def process_single_chunk(chunk: Dict[str, Any], total_chunks: int, language: str = None, provider: str = "openai", job_id: str = None, reuse_completed: bool = False) -> Dict[str, Any]:
+def process_single_chunk(chunk: Dict[str, Any], total_chunks: int, language: str = None, provider: str = "openai", job_id: str = None, reuse_completed: bool = False, user_id: str = None) -> Dict[str, Any]:
     """
     Process a single audio chunk: download and transcribe.
     Used by ThreadPoolExecutor for parallel processing.
@@ -428,6 +454,7 @@ def process_single_chunk(chunk: Dict[str, Any], total_chunks: int, language: str
         result = transcribe_audio(
             chunk_data, f"chunk_{chunk_index}.m4a", language=language, provider=provider,
             cancellation_check=(lambda: ensure_job_active(job_id)) if job_id else None,
+            user_id=user_id,
         )
         if job_id:
             ensure_job_active(job_id)
@@ -491,7 +518,7 @@ def process_chunked_job(job: Dict[str, Any]):
         with ThreadPoolExecutor(max_workers=MAX_CHUNK_WORKERS) as executor:
             # Submit all chunks for parallel processing
             future_to_chunk = {
-                executor.submit(process_single_chunk, chunk, len(chunks), language, provider, job_id, bool(job.get("retry_count"))): chunk
+                executor.submit(process_single_chunk, chunk, len(chunks), language, provider, job_id, bool(job.get("retry_count")), job.get("user_id")): chunk
                 for chunk in chunks
             }
 
@@ -547,16 +574,10 @@ def process_chunked_job(job: Dict[str, Any]):
         summary = generate_summary(full_transcript)
         update_job_progress(job_id, 80, "Summary generated")
 
-        # 5b: Overview + Actions in PARALLEL (80-90%) - both only need summary
-        print(f"   🚀 Generating overview and actions in parallel...")
-        update_job_progress(job_id, 80, "Generating overview and extracting actions...")
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            overview_future = executor.submit(generate_overview, summary)
-            actions_future = executor.submit(extract_actions, summary)
-
-            overview = overview_future.result()
-            actions = actions_future.result()
+        # 5b: Overview, actions, and reader cleanup in parallel. All three use the
+        # summary or the raw transcript; none of them feeds the summary.
+        update_job_progress(job_id, 80, "Cleaning up the transcript...")
+        overview, actions, reader_transcript = derive_reader_results(full_transcript, language, summary, job.get("user_id"))
 
         update_job_progress(job_id, 90, "AI content generated")
 
@@ -572,7 +593,8 @@ def process_chunked_job(job: Dict[str, Any]):
         ensure_job_active(job_id)
         update_job_with_results(
             job_id=job_id,
-            transcript=full_transcript,
+            transcript=reader_transcript,
+            raw_transcript=full_transcript,
             overview=overview,
             summary=summary,
             actions=actions,
@@ -581,7 +603,7 @@ def process_chunked_job(job: Dict[str, Any]):
 
         print(f"✅ Chunked job {job_id} completed successfully!")
         print(f"   - Chunks processed: {len(chunks)}")
-        print(f"   - Total transcript: {len(full_transcript)} chars")
+        print(f"   - Total transcript: {len(reader_transcript)} chars")
         print(f"   - Overview: {overview[:80]}...")
         print(f"   - Summary: {len(summary)} chars")
         print(f"   - Actions: {len(actions)} items")
@@ -669,7 +691,8 @@ def process_job(job: Dict[str, Any]):
             progress_callback=transcription_progress,
             language=language,
             provider=provider,
-            cancellation_check=lambda: ensure_job_active(job_id)
+            cancellation_check=lambda: ensure_job_active(job_id),
+            user_id=job.get("user_id"),
         )
 
         transcript = result["transcript"]
@@ -686,16 +709,10 @@ def process_job(job: Dict[str, Any]):
         summary = generate_summary(transcript)
         update_job_progress(job_id, 75, "Summary generated")
 
-        # 4b: Overview + Actions in PARALLEL (75-90%) - both only need summary
-        print(f"   🚀 Generating overview and actions in parallel...")
-        update_job_progress(job_id, 75, "Generating overview and extracting actions...")
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            overview_future = executor.submit(generate_overview, summary)
-            actions_future = executor.submit(extract_actions, summary)
-
-            overview = overview_future.result()
-            actions = actions_future.result()
+        # 4b: Overview, actions, and reader cleanup in parallel. The summary above
+        # stays on the raw transcript.
+        update_job_progress(job_id, 75, "Cleaning up the transcript...")
+        overview, actions, reader_transcript = derive_reader_results(transcript, language, summary, job.get("user_id"))
 
         update_job_progress(job_id, 90, "AI content generated")
 
@@ -706,7 +723,8 @@ def process_job(job: Dict[str, Any]):
         ensure_job_active(job_id)
         update_job_with_results(
             job_id=job_id,
-            transcript=transcript,
+            transcript=reader_transcript,
+            raw_transcript=transcript,
             overview=overview,
             summary=summary,
             actions=actions,
@@ -715,7 +733,7 @@ def process_job(job: Dict[str, Any]):
         # update_job_with_results automatically sets progress to 100% and stage to "Complete"
 
         print(f"✅ Job {job_id} completed successfully!")
-        print(f"   - Transcript: {len(transcript)} chars")
+        print(f"   - Transcript: {len(reader_transcript)} chars")
         print(f"   - Overview: {overview[:80]}...")
         print(f"   - Summary: {len(summary)} chars")
         print(f"   - Actions: {len(actions)} items")

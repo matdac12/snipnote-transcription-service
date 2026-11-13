@@ -60,15 +60,23 @@ class JobTests(unittest.TestCase):
                 'get_job': {'status': 'processing'}, 'reset_chunk_transcripts': None, 'update_job_status': None, 'update_job_progress': None, 'update_chunk_transcript': None,
                 'update_chunks_processed': None, 'increment_retry_count': None, 'update_job_with_results': None,
                 'transcribe_audio': {'transcript': 'transcript', 'duration': 30},
-                'generate_summary': 'summary', 'generate_overview': 'overview', 'extract_actions': []}.items():
+                'generate_summary': 'summary', 'generate_overview': 'overview', 'extract_actions': [],
+                'clean_transcript': 'cleaned transcript'}.items():
                 mocks[name] = stack.enter_context(patch.object(jobs, name, return_value=result))
             jobs.process_job(job)
             calls = mocks['transcribe_audio'].call_args_list
             self.assertEqual(len(calls), 2 if chunked else 1)
             self.assertEqual([call.kwargs.get('provider') for call in calls], [provider or 'openai'] * len(calls))
-            mocks['generate_summary'].assert_called_once_with('transcript\ntranscript' if chunked else 'transcript')
+            self.assertEqual([call.kwargs.get('user_id') for call in calls], ['user'] * len(calls))
+            raw = 'transcript\ntranscript' if chunked else 'transcript'
+            mocks['generate_summary'].assert_called_once_with(raw)
             mocks['generate_overview'].assert_called_once_with('summary')
             mocks['extract_actions'].assert_called_once_with('summary')
+            self.assertEqual(mocks['clean_transcript'].call_args.args[:3], (raw, 'it', 'summary'))
+            saved = mocks['update_job_with_results'].call_args.kwargs
+            self.assertEqual(saved['transcript'], 'cleaned transcript')
+            self.assertEqual(saved['raw_transcript'], raw)
+            self.assertEqual(saved['summary'], 'summary')
             mocks['increment_retry_count'].assert_not_called()
             mocks['update_job_with_results'].assert_called_once()
 
@@ -158,6 +166,22 @@ class ReliabilityTests(unittest.TestCase):
             self.assertEqual(create.call_count, 1)
             self.assertIsNone(chunk['transcript'])
 
+    def test_cleanup_failure_keeps_the_raw_transcript(self):
+        with ExitStack() as stack:
+            for name, value in {
+                'get_job': {'status': 'processing'}, 'download_audio': b'audio', 'update_job_status': None,
+                'update_job_progress': None, 'transcribe_audio': {'transcript': 'raw words', 'duration': 12},
+                'generate_summary': 'summary', 'generate_overview': 'overview', 'extract_actions': [],
+            }.items():
+                stack.enter_context(patch.object(jobs, name, return_value=value))
+            stack.enter_context(patch.object(jobs, 'clean_transcript', side_effect=RuntimeError('cleanup down')))
+            retry = stack.enter_context(patch.object(jobs, 'increment_retry_count'))
+            saved = stack.enter_context(patch.object(jobs, 'update_job_with_results'))
+            jobs.process_job({'id': 'job', 'meeting_id': 'meeting', 'audio_url': 'url', 'language': 'it'})
+            retry.assert_not_called()
+            self.assertEqual(saved.call_args.kwargs['transcript'], 'raw words')
+            self.assertEqual(saved.call_args.kwargs['raw_transcript'], 'raw words')
+
     def test_all_empty_meeting_fails_without_generating_summary(self):
         with ExitStack() as stack:
             for name, value in {'get_job': {'status': 'processing'}, 'download_audio': b'audio', 'update_job_status': None, 'update_job_progress': None, 'transcribe_audio': {'transcript': '', 'duration': 3}}.items():
@@ -197,3 +221,25 @@ class CancellationRaceTests(unittest.TestCase):
                 with self.assertRaises(Exception) as error:
                     operation()
                 self.assertFalse(jobs.is_retryable_error(error.exception))
+
+    def test_missing_raw_transcript_column_saves_the_reader_transcript(self):
+        class Query:
+            def __init__(self):
+                self.payloads = []
+            def update(self, data):
+                self.data = data
+                return self
+            def eq(self, *args): return self
+            def in_(self, *args): return self
+            def execute(self):
+                self.payloads.append(dict(self.data))
+                if 'raw_transcript' in self.data:
+                    raise RuntimeError("Could not find the 'raw_transcript' column of 'transcription_jobs' in the schema cache (PGRST204)")
+                return SimpleNamespace(data=[{'id': 'job', **self.data}])
+        query = Query()
+        with patch.object(supabase_client.supabase, 'table', return_value=query):
+            saved = supabase_client.update_job_with_results('job', 'cleaned', 'overview', 'summary', [], 3, raw_transcript='raw words')
+        self.assertEqual(saved['transcript'], 'cleaned')
+        self.assertNotIn('raw_transcript', saved)
+        self.assertEqual(query.payloads[1]['transcript'], 'cleaned')
+        self.assertNotIn('raw_transcript', query.payloads[1])
