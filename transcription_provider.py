@@ -8,7 +8,10 @@ import httpx
 from openai import OpenAI
 
 from ai_config import create_transcription, get_task_config
+from speaker_transcript import render_speaker_transcript, stitch_short_intrusions, turns_from_words
 from vocabulary import terms_for_user
+
+XAI_HTTP_TIMEOUT = 1800.0
 
 XAI_DEFAULT_CONFIG = {
     'model': 'grok-voice-transcribe-2.0',
@@ -37,7 +40,7 @@ def validate_transcription_provider(provider: str) -> str:
 def create_provider_transcription(
     client: OpenAI, file: io.BytesIO,
     language: Optional[str] = None, provider: str = 'openai',
-    user_id: Optional[str] = None,
+    user_id: Optional[str] = None, diarize: bool = False,
 ) -> str:
     validate_transcription_provider(provider)
     terms = terms_for_user(user_id)
@@ -59,6 +62,8 @@ def create_provider_transcription(
             options.update(language=language, format='true')
         if terms:
             options['keyterm'] = terms
+        if diarize:
+            options['diarize'] = 'true'
         try:
             # httpx encodes data fields before files. Rebuild for every attempt.
             return http.post(
@@ -71,7 +76,7 @@ def create_provider_transcription(
         except httpx.RequestError:
             raise TranscriptionProviderError('xAI transcription connection error') from None
 
-    with httpx.Client(timeout=120.0) as http:
+    with httpx.Client(timeout=XAI_HTTP_TIMEOUT if diarize else 120.0) as http:
         response = call(http, config['model'])
         fallback = config['fallback_model']
         if response.status_code in (400, 404) and fallback and fallback != config['model']:
@@ -88,6 +93,8 @@ def create_provider_transcription(
                 f'xAI transcription returned invalid response: malformed JSON (HTTP {response.status_code})',
                 response.status_code, retryable=True,
             ) from None
+        if diarize:
+            return _speaker_transcript_from_output(output, response.status_code)
         text = output.get('text') if isinstance(output, dict) else None
         if not isinstance(text, str):
             raise TranscriptionProviderError(
@@ -100,3 +107,27 @@ def create_provider_transcription(
             print('   ℹ️ xAI returned HTTP 200 with no recognized speech')
             return ''
         return text
+
+
+def _speaker_transcript_from_output(output, status_code: int) -> str:
+    words = output.get('words') if isinstance(output, dict) else None
+    if not isinstance(words, list):
+        raise TranscriptionProviderError(
+            f'xAI transcription returned invalid response: missing or non-list words (HTTP {status_code})',
+            status_code, retryable=True,
+        )
+    text = output.get('text') if isinstance(output, dict) else None
+    if not words:
+        if not isinstance(text, str) or not text.strip():
+            print('   ℹ️ xAI returned HTTP 200 with no recognized speech')
+            return ''
+        raise TranscriptionProviderError(
+            f'xAI transcription returned invalid response: words missing speaker (HTTP {status_code})',
+            status_code, retryable=False,
+        )
+    if any(not isinstance(word, dict) or 'speaker' not in word for word in words):
+        raise TranscriptionProviderError(
+            f'xAI transcription returned invalid response: words missing speaker (HTTP {status_code})',
+            status_code, retryable=False,
+        )
+    return render_speaker_transcript(stitch_short_intrusions(turns_from_words(words)))

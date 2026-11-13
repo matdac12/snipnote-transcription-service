@@ -77,6 +77,51 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn('senza biologiche', terms)
         self.assertLessEqual(len(terms), 100)
 
+    def _send_diarize(self, output, diarize):
+        timeouts = []
+
+        def handle(request):
+            self.calls.append(request)
+            return httpx.Response(200, json=output)
+
+        http = httpx.Client(transport=httpx.MockTransport(handle))
+
+        def client_factory(*_args, **kwargs):
+            timeouts.append(kwargs.get('timeout'))
+            return http
+
+        with patch('transcription_provider.httpx.Client', side_effect=client_factory):
+            text = create_provider_transcription(
+                self.client, self.file, 'it', 'xai', diarize=diarize,
+            )
+        return text, timeouts
+
+    def test_diarize_posts_flag_uses_long_timeout_and_renders_speakers(self):
+        text, timeouts = self._send_diarize(
+            {'text': 'plain ciao', 'words': [{'text': 'Ciao', 'start': 0, 'end': 1, 'speaker': 0}]},
+            True,
+        )
+        self.assertEqual(text, '[0:00:00–0:00:01] Speaker 1\nCiao\n')
+        self.assertNotEqual(text, 'plain ciao')
+        self.assertEqual(timeouts, [1800.0])
+        body = self.calls[0].content
+        self.assertIn(b'name="diarize"\r\n\r\ntrue', body)
+        self.assertLess(body.index(b'name="diarize"'), body.index(b'name="file"'))
+
+    def test_diarize_without_speaker_on_words_is_not_a_plain_transcript(self):
+        from transcription_provider import TranscriptionProviderError
+        with self.assertRaises(TranscriptionProviderError):
+            self._send_diarize(
+                {'text': 'plain ciao', 'words': [{'text': 'Ciao', 'start': 0, 'end': 1}]},
+                True,
+            )
+
+    def test_plain_xai_omits_diarize_and_keeps_short_timeout(self):
+        text, timeouts = self._send_diarize({'text': 'Meeting transcript'}, False)
+        self.assertEqual(text, 'Meeting transcript')
+        self.assertEqual(timeouts, [120.0])
+        self.assertNotIn(b'diarize', self.calls[0].content)
+
     def test_xai_receives_personal_keyterms_before_the_file(self):
         user = 'e6658fad-05e2-4d25-9779-857bc72bbc81'
         self.send(language='it', provider='xai')
