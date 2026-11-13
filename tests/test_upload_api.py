@@ -56,6 +56,23 @@ class UploadAPITests(unittest.TestCase):
         self.assertEqual(response.status_code, 422, response.text)
         self.assertFalse(self.repo.sessions)
 
+    def test_speaker_labels_with_unknown_provider_or_no_files_is_400(self):
+        headers = {'Authorization': 'Bearer owner'}
+        unknown = self.speaker_body(transcription_provider='nope')
+        empty = self.speaker_body()
+        empty['files'] = []
+        for body in (unknown, empty):
+            self.repo.sessions.clear()
+            response = self.client.post('/upload-sessions', json=body, headers=headers)
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertEqual(response.json()['detail']['code'], 'speaker_labels_require_one_xai_file')
+            self.assertFalse(self.repo.sessions)
+        plain_unknown = dict(self.body, transcription_provider='nope')
+        self.assertEqual(self.client.post('/upload-sessions', json=plain_unknown, headers=headers).status_code, 422)
+        plain_empty = dict(self.body)
+        plain_empty['files'] = []
+        self.assertEqual(self.client.post('/upload-sessions', json=plain_empty, headers=headers).status_code, 422)
+
     def test_speaker_labels_with_openai_or_two_files_is_rejected_before_storage(self):
         headers = {'Authorization': 'Bearer owner'}
         openai = self.speaker_body(50, transcription_provider='openai')

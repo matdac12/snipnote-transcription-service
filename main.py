@@ -1,4 +1,8 @@
+import json
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends, Form, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Literal
@@ -180,6 +184,31 @@ from uuid import UUID
 
 def upload_identity(authorization: str | None = Header(default=None)) -> str:
     return verify_upload_user(authorization)
+
+def _speaker_schema_body(exc: RequestValidationError):
+    body = exc.body
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            body = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+    elif isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+    return body if isinstance(body, dict) else None
+
+@app.exception_handler(RequestValidationError)
+async def speaker_labels_require_one_xai_file(request: Request, exc: RequestValidationError):
+    """A speaker request that is not one xAI file is HTTP 400, including shapes
+    the schema rejects. Size and media errors on a valid one-file xAI request stay 422."""
+    body = _speaker_schema_body(exc)
+    files = body.get("files") if isinstance(body, dict) else None
+    if request.url.path == "/upload-sessions" and isinstance(body, dict) and body.get("speaker_labels") is True:
+        if body.get("transcription_provider") != "xai" or not isinstance(files, list) or len(files) != 1:
+            return JSONResponse(status_code=400, content={"detail": {"code": "speaker_labels_require_one_xai_file"}})
+    return await request_validation_exception_handler(request, exc)
 
 @app.get('/upload-capabilities')
 def upload_capabilities(user_id: str = Depends(upload_identity)):
