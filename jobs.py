@@ -377,12 +377,32 @@ Meeting Summary: {summary}"""
         return []
 
 
-def prepare_reader_transcript(transcript: str, language: str | None, summary: str, user_id: str | None = None) -> str:
+def cleanup_progress(job_id: str):
+    """Report cleanup progress. A cancelled job raises TranscriptionCancelled here and stops cleanup."""
+    def report(done: int, total: int):
+        update_job_progress(
+            job_id,
+            80 + int(10 * done / total) if total else 80,
+            f"Cleaning transcript, {done} of {total}",
+        )
+    return report
+
+
+def prepare_reader_transcript(
+    transcript: str,
+    language: str | None,
+    summary: str,
+    user_id: str | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> str:
     """Clean the transcript people read. A cleanup failure keeps the raw words."""
     try:
         cleaned = clean_transcript(
-            transcript, language, summary, openai_client, vocabulary=entries_for_user(user_id),
+            transcript, language, summary, openai_client,
+            vocabulary=entries_for_user(user_id), on_progress=on_progress,
         )
+    except TranscriptionCancelled:
+        raise
     except Exception as error:
         print(f"   ⚠️ Transcript cleanup failed, keeping the raw transcript: {error}")
         return transcript
@@ -391,13 +411,14 @@ def prepare_reader_transcript(transcript: str, language: str | None, summary: st
     return cleaned
 
 
-def derive_reader_results(transcript: str, language: str | None, summary: str, user_id: str | None = None):
+def derive_reader_results(transcript: str, language: str | None, summary: str, user_id: str | None = None, job_id: str | None = None):
     """Overview, actions, and the reader transcript. The summary was built from the raw transcript."""
     print("   🚀 Generating overview, actions, and transcript cleanup in parallel...")
+    on_progress = cleanup_progress(job_id) if job_id else None
     with ThreadPoolExecutor(max_workers=3) as executor:
         overview_future = executor.submit(generate_overview, summary)
         actions_future = executor.submit(extract_actions, summary)
-        clean_future = executor.submit(prepare_reader_transcript, transcript, language, summary, user_id)
+        clean_future = executor.submit(prepare_reader_transcript, transcript, language, summary, user_id, on_progress)
         return overview_future.result(), actions_future.result(), clean_future.result()
 
 
@@ -569,9 +590,9 @@ def process_chunked_job(job: Dict[str, Any]):
         update_job_progress(job_id, 80, "Summary generated")
 
         # 5b: Overview, actions, and reader cleanup in parallel. All three use the
-        # summary or the raw transcript; none of them feeds the summary.
-        update_job_progress(job_id, 80, "Cleaning up the transcript...")
-        overview, actions, reader_transcript = derive_reader_results(full_transcript, language, summary, job.get("user_id"))
+        # summary or the raw transcript; none of them feeds the summary. Cleanup
+        # reports "Cleaning transcript, N of M" as each window finishes.
+        overview, actions, reader_transcript = derive_reader_results(full_transcript, language, summary, job.get("user_id"), job_id)
 
         update_job_progress(job_id, 90, "AI content generated")
 
@@ -714,9 +735,8 @@ def process_job(job: Dict[str, Any]):
         update_job_progress(job_id, 75, "Summary generated")
 
         # 4b: Overview, actions, and reader cleanup in parallel. The summary above
-        # stays on the raw transcript.
-        update_job_progress(job_id, 75, "Cleaning up the transcript...")
-        overview, actions, reader_transcript = derive_reader_results(transcript, language, summary, job.get("user_id"))
+        # stays on the raw transcript. Cleanup reports "Cleaning transcript, N of M".
+        overview, actions, reader_transcript = derive_reader_results(transcript, language, summary, job.get("user_id"), job_id)
 
         update_job_progress(job_id, 90, "AI content generated")
 

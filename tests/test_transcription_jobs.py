@@ -327,3 +327,64 @@ class CancellationRaceTests(unittest.TestCase):
         self.assertNotIn('raw_transcript', saved)
         self.assertEqual(query.payloads[1]['transcript'], 'cleaned')
         self.assertNotIn('raw_transcript', query.payloads[1])
+
+
+class CleanupProgressTests(unittest.TestCase):
+    SPEAKER = (
+        '[0:00:00–0:00:01] Speaker 1\nuno\n\n'
+        '[0:00:01–0:00:02] Speaker 2\ndue\n\n'
+        '[0:00:02–0:00:03] Speaker 1\ntre\n'
+    )
+
+    def _run(self, stack, progress_side_effect=None):
+        import transcript_cleanup
+        for name, value in {
+            'get_job': {'status': 'processing'}, 'download_audio': b'audio', 'update_job_status': None,
+            'transcribe_audio': {'transcript': self.SPEAKER, 'duration': 12},
+            'generate_summary': 'summary', 'generate_overview': 'overview', 'extract_actions': [],
+            'entries_for_user': [],
+        }.items():
+            stack.enter_context(patch.object(jobs, name, return_value=value))
+        progress = stack.enter_context(patch.object(jobs, 'update_job_progress', side_effect=progress_side_effect))
+        stack.enter_context(patch.object(transcript_cleanup, 'WINDOW_WORDS', 1))
+        stack.enter_context(patch.object(transcript_cleanup, 'MAX_WINDOW_WORKERS', 1))
+        requests = stack.enter_context(patch.object(transcript_cleanup, '_request_edits', return_value=[]))
+        retry = stack.enter_context(patch.object(jobs, 'increment_retry_count'))
+        saved = stack.enter_context(patch.object(jobs, 'update_job_with_results'))
+        jobs.process_job({'id': 'job', 'meeting_id': 'meeting', 'audio_url': 'url', 'language': 'it'})
+        return progress, requests, retry, saved
+
+    def test_cleanup_reports_each_group_with_the_exact_stage(self):
+        with ExitStack() as stack:
+            progress, requests, retry, saved = self._run(stack)
+        stages = [call.args for call in progress.call_args_list]
+        cleaning = [args for args in stages if args[2].startswith('Cleaning')]
+        self.assertEqual(cleaning, [
+            ('job', 80, 'Cleaning transcript, 0 of 3'),
+            ('job', 83, 'Cleaning transcript, 1 of 3'),
+            ('job', 86, 'Cleaning transcript, 2 of 3'),
+            ('job', 90, 'Cleaning transcript, 3 of 3'),
+        ])
+        self.assertNotIn('Cleaning up the transcript...', [args[2] for args in stages])
+        self.assertEqual(requests.call_count, 3)
+        saved.assert_called_once()
+        retry.assert_not_called()
+
+    def test_cancellation_during_cleanup_stops_model_calls_and_saves_nothing(self):
+        def progress(job_id, pct, stage):
+            if stage == 'Cleaning transcript, 1 of 3':
+                raise jobs.TranscriptionCancelled('Job job no longer active')
+
+        with ExitStack() as stack:
+            _progress, requests, retry, saved = self._run(stack, progress)
+        self.assertEqual(requests.call_count, 1)
+        saved.assert_not_called()
+        retry.assert_not_called()
+
+    def test_prepare_reader_transcript_does_not_swallow_cancellation(self):
+        def cancel(*args, **kwargs):
+            raise jobs.TranscriptionCancelled('gone')
+
+        with patch.object(jobs, 'clean_transcript', side_effect=cancel), patch.object(jobs, 'entries_for_user', return_value=[]):
+            with self.assertRaises(jobs.TranscriptionCancelled):
+                jobs.prepare_reader_transcript('raw', 'it', 'summary')

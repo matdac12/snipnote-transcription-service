@@ -180,3 +180,156 @@ class RequestTests(unittest.TestCase):
         with patch.object(transcript_cleanup, "_request_edits", side_effect=RuntimeError("429")):
             cleaned = transcript_cleanup.clean_transcript("parte parte il disastro", "it", "", client=object())
         self.assertEqual(cleaned, "parte parte il disastro")
+
+
+SEPARATOR = "\n␞\n"
+
+
+def _speaker(turns):
+    return "\n\n".join(
+        f"[0:00:{index:02d}–0:00:{index + 1:02d}] Speaker {index % 2 + 1}\n{body}"
+        for index, body in enumerate(turns)
+    ) + "\n"
+
+
+class SpeakerGroupingTests(unittest.TestCase):
+    def test_short_turns_share_model_calls_and_headers_stay_byte_for_byte(self):
+        turns = ["Ciao ehm Mattia", "buongiorno a tutti", "il il budget", "va bene grazie"]
+        text = _speaker(turns)
+        seen = []
+
+        def fake(_client, window, _context, _language, _vocabulary):
+            seen.append(window)
+            if "ehm" in window:
+                return [_edit("Ciao ehm Mattia", "Ciao Mattia", kind="filler")]
+            return []
+
+        with patch.object(transcript_cleanup, "WINDOW_WORDS", 6), patch.object(transcript_cleanup, "_request_edits", side_effect=fake):
+            cleaned = transcript_cleanup.clean_transcript(text, "it", "", client=object())
+        self.assertEqual(len(seen), 2)
+        self.assertLess(len(seen), len(turns))
+        self.assertEqual(sorted(seen), sorted([
+            "Ciao ehm Mattia" + SEPARATOR + "buongiorno a tutti",
+            "il il budget" + SEPARATOR + "va bene grazie",
+        ]))
+        for window in seen:
+            self.assertNotIn("Speaker", window)
+        expected = _speaker(["Ciao Mattia", "buongiorno a tutti", "il il budget", "va bene grazie"])
+        self.assertEqual(cleaned, expected)
+        original_headers = [line for line in text.splitlines() if line.startswith("[")]
+        cleaned_headers = [line for line in cleaned.splitlines() if line.startswith("[")]
+        self.assertEqual(cleaned_headers, original_headers)
+
+    def test_an_edit_across_the_separator_keeps_that_group_raw(self):
+        text = _speaker(["fine fine", "fine del discorso"])
+
+        def fake(_client, window, _context, _language, _vocabulary):
+            return [_edit("fine" + SEPARATOR + "fine del", "fine del", kind="repetition")]
+
+        with patch.object(transcript_cleanup, "_request_edits", side_effect=fake):
+            cleaned = transcript_cleanup.clean_transcript(text, "it", "", client=object())
+        self.assertEqual(cleaned, text)
+
+    def test_an_edit_that_breaks_the_separator_line_keeps_that_group_raw(self):
+        text = _speaker(["prima parte qui.", "seconda parte qui"])
+
+        def fake(_client, window, _context, _language, _vocabulary):
+            return [_edit("prima parte qui.\n", "prima parte qui.", kind="punctuation")]
+
+        with patch.object(transcript_cleanup, "_request_edits", side_effect=fake):
+            cleaned = transcript_cleanup.clean_transcript(text, "it", "", client=object())
+        self.assertEqual(cleaned, text)
+
+    def test_body_with_record_separator_is_cleaned_alone(self):
+        turns = ["uno due tre", "strano ␞ testo", "quattro cinque"]
+        text = _speaker(turns)
+        seen = []
+
+        def fake(_client, window, _context, _language, _vocabulary):
+            seen.append(window)
+            return []
+
+        with patch.object(transcript_cleanup, "_request_edits", side_effect=fake):
+            cleaned = transcript_cleanup.clean_transcript(text, "it", "", client=object())
+        # The odd turn goes alone, and neighbours are not grouped across it.
+        self.assertEqual(sorted(seen), sorted(["uno due tre", "strano ␞ testo", "quattro cinque"]))
+        self.assertEqual(cleaned, text)
+
+    def test_long_turn_is_windowed_and_rejoined_under_its_own_header(self):
+        turns = ["a b c d e", "uno due"]
+        text = _speaker(turns)
+        seen = []
+
+        def fake(_client, window, _context, _language, _vocabulary):
+            seen.append(window)
+            return []
+
+        with patch.object(transcript_cleanup, "WINDOW_WORDS", 2), patch.object(transcript_cleanup, "_request_edits", side_effect=fake):
+            cleaned = transcript_cleanup.clean_transcript(text, "it", "", client=object())
+        self.assertEqual(sorted(seen), sorted(["a b", "c d", "e", "uno due"]))
+        self.assertEqual(cleaned, text)
+
+    def test_failed_group_keeps_its_original_words(self):
+        text = _speaker(["il il budget", "parte parte qui", "ciao ciao a tutti"])
+
+        def fake(_client, window, _context, _language, _vocabulary):
+            if "budget" in window:
+                raise RuntimeError("429")
+            return [_edit("parte parte qui", "parte qui")]
+
+        with patch.object(transcript_cleanup, "WINDOW_WORDS", 3), patch.object(transcript_cleanup, "_request_edits", side_effect=fake):
+            cleaned = transcript_cleanup.clean_transcript(text, "it", "", client=object())
+        self.assertEqual(cleaned, _speaker(["il il budget", "parte qui", "ciao ciao a tutti"]))
+
+
+class CleanupProgressTests(unittest.TestCase):
+    def test_progress_runs_from_zero_through_the_group_count(self):
+        text = _speaker(["uno due", "tre quattro", "cinque sei", "sette otto"])
+        calls = []
+        with patch.object(transcript_cleanup, "WINDOW_WORDS", 4), patch.object(transcript_cleanup, "_request_edits", return_value=[]):
+            transcript_cleanup.clean_transcript(
+                text, "it", "", client=object(), on_progress=lambda done, total: calls.append((done, total)),
+            )
+        self.assertEqual(calls, [(0, 2), (1, 2), (2, 2)])
+
+    def test_plain_transcript_reports_progress_per_window(self):
+        calls = []
+        with patch.object(transcript_cleanup, "_request_edits", return_value=[]):
+            transcript_cleanup.clean_transcript(
+                "prima seconda terza", "it", "", client=object(),
+                on_progress=lambda done, total: calls.append((done, total)),
+            )
+        self.assertEqual(calls, [(0, 1), (1, 1)])
+
+    def test_raising_callback_aborts_and_stops_scheduling(self):
+        text = _speaker(["uno", "due", "tre", "quattro"])
+        requests = []
+
+        class Stop(Exception):
+            pass
+
+        def progress(done, total):
+            if done == 1:
+                raise Stop()
+
+        def fake(_client, window, _context, _language, _vocabulary):
+            requests.append(window)
+            return []
+
+        with patch.object(transcript_cleanup, "WINDOW_WORDS", 1), patch.object(transcript_cleanup, "MAX_WINDOW_WORKERS", 1), \
+                patch.object(transcript_cleanup, "_request_edits", side_effect=fake):
+            with self.assertRaises(Stop):
+                transcript_cleanup.clean_transcript(text, "it", "", client=object(), on_progress=progress)
+        self.assertEqual(requests, ["uno"])
+
+    def test_raising_on_the_zero_update_makes_no_model_call(self):
+        class Stop(Exception):
+            pass
+
+        def progress(done, total):
+            raise Stop()
+
+        with patch.object(transcript_cleanup, "_request_edits") as request:
+            with self.assertRaises(Stop):
+                transcript_cleanup.clean_transcript(_speaker(["uno"]), "it", "", client=object(), on_progress=progress)
+        request.assert_not_called()

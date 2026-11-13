@@ -9,8 +9,8 @@ the transcript.
 
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from typing import Callable, Optional
 
 from openai import OpenAI
 
@@ -28,6 +28,12 @@ _PROTECTED = {"senza", "non", "mai", "niente", "nessuno", "not", "never"}
 
 _WORD = re.compile(r"[^\W_]+", re.UNICODE)
 _SPEAKER_HEADER = re.compile(r"^\[\d+:\d{2}:\d{2}–\d+:\d{2}:\d{2}\] Speaker \d+$")
+# Several short speaker turns go to the model as one window, one body per
+# record, separated by this line. Headers are never part of the window.
+TURN_MARK = "\u241e"
+TURN_SEPARATOR = f"\n{TURN_MARK}\n"
+
+ProgressCallback = Callable[[int, int], None]
 
 SYSTEM = """You are a transcript cleanup editor for a meeting-transcription product. You receive a machine transcript of a real conversation and return surgical edits. The transcript is a record of what people said: your job is to remove machine and speech noise, NOT to improve the speakers' grammar, style, or word choice.
 
@@ -38,6 +44,7 @@ EDIT FORMAT
 Each edit is {"op", "find", "replace", "type", "confidence", "evidence", "reason"}:
 - op: "delete" or "replace"
 - find: EXACT verbatim substring copied from the transcript (same characters, punctuation, casing), 3-12 words, unique in the window. Use the smallest span that contains the problem plus enough context to be unique.
+  A line holding only ␞ separates two speaker turns. Never put ␞ in find or replace, and never make an edit that spans it.
 - replace: "" when op is "delete". When op is "replace", the minimal corrected text, keeping as much of the original span as possible.
 - type: "filler" | "repetition" | "false_start" | "misheard" | "punctuation"
 - confidence: "high" or "medium" (see below). Do not emit low-confidence edits.
@@ -306,24 +313,154 @@ def _edits_or_none(client: OpenAI, window: str, context: str, language: Optional
         return []
 
 
+def _run_requests(windows_to_clean: list[str], request: Callable[[str], list[dict]], on_progress: Optional[ProgressCallback]) -> list[list[dict]]:
+    """Request edits for each window, a few at a time. Results keep window order.
+
+    on_progress runs on this thread, never in a worker. If it raises, no more
+    windows are scheduled, unstarted ones are cancelled, and the error is raised.
+    """
+    total = len(windows_to_clean)
+    results: list[list[dict]] = [[] for _ in range(total)]
+    if on_progress:
+        on_progress(0, total)
+    if not total:
+        return results
+    workers = min(MAX_WINDOW_WORKERS, total)
+    executor = ThreadPoolExecutor(max_workers=workers)
+    queue = iter(range(total))
+    pending = {}
+
+    def schedule_next():
+        index = next(queue, None)
+        if index is not None:
+            pending[executor.submit(request, windows_to_clean[index])] = index
+
+    try:
+        for _ in range(workers):
+            schedule_next()
+        done = 0
+        while pending:
+            finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in finished:
+                results[pending.pop(future)] = future.result()
+                done += 1
+                if on_progress:
+                    on_progress(done, total)
+                schedule_next()
+    except BaseException:
+        # Calls already running cannot be stopped; their results are discarded.
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    executor.shutdown(wait=True)
+    return results
+
+
+def _requester(client: OpenAI, context: str, language: Optional[str], vocabulary: Optional[list[dict]]):
+    entries = vocabulary or []
+    vocabulary_text = format_for_cleanup(entries) if entries else "(none)"
+    meeting_context = (context or "")[:CONTEXT_CHARS]
+
+    def request(window: str) -> list[dict]:
+        return _edits_or_none(client, window, meeting_context, language, vocabulary_text)
+
+    return entries, request
+
+
 def clean_transcript(
     transcript: str,
     language: Optional[str],
     context: str,
     client: OpenAI,
     vocabulary: Optional[list[dict]] = None,
+    on_progress: Optional[ProgressCallback] = None,
 ) -> str:
-    """Return the transcript with safe edits applied. Unusable output stays raw."""
+    """Return the transcript with safe edits applied. Unusable output stays raw.
+
+    on_progress(done, total) is called with (0, total) before the first model
+    call and once after each call finishes. An exception from it aborts cleanup.
+    """
     if not transcript.strip():
         return transcript
     blocks = split_speaker_blocks(transcript)
     if blocks[0][0] is None:
-        return _clean_body(transcript, language, context, client, vocabulary)
-    cleaned = [
-        (header, _clean_body(body, language, context, client, vocabulary) if body.strip() else body)
-        for header, body in blocks
-    ]
-    return join_speaker_blocks(cleaned)
+        return _clean_body(transcript, language, context, client, vocabulary, on_progress)
+    return join_speaker_blocks(_clean_speaker_blocks(blocks, language, context, client, vocabulary, on_progress))
+
+
+def _clean_speaker_blocks(
+    blocks: list[tuple[str | None, str]],
+    language: Optional[str],
+    context: str,
+    client: OpenAI,
+    vocabulary: Optional[list[dict]],
+    on_progress: Optional[ProgressCallback],
+) -> list[tuple[str | None, str]]:
+    """Clean speaker bodies in shared windows. Headers never reach the model."""
+    entries, request = _requester(client, context, language, vocabulary)
+    pieces: list[str] = []
+    # (kind, turn indices, piece indices). "group" is one piece of whole turns
+    # joined by TURN_SEPARATOR; "turn" is one turn split into plain windows.
+    plan: list[tuple[str, list[int], list[int]]] = []
+    group: list[int] = []
+    group_words = 0
+
+    def close_group():
+        nonlocal group, group_words
+        if group:
+            plan.append(("group", group, [len(pieces)]))
+            pieces.append(TURN_SEPARATOR.join(blocks[index][1] for index in group))
+            group, group_words = [], 0
+
+    for index, (_header, body) in enumerate(blocks):
+        if not body.strip():
+            continue
+        count = len(body.split())
+        if count > WINDOW_WORDS or TURN_MARK in body:
+            close_group()
+            parts = windows(body)
+            plan.append(("turn", [index], list(range(len(pieces), len(pieces) + len(parts)))))
+            pieces.extend(parts)
+            continue
+        if group and group_words + count > WINDOW_WORDS:
+            close_group()
+        group.append(index)
+        group_words += count
+    close_group()
+
+    edit_lists = _run_requests(pieces, request, on_progress)
+
+    bodies = [body for _header, body in blocks]
+    applied_count = 0
+    for kind, turns, piece_indices in plan:
+        if kind == "turn":
+            cleaned_parts = []
+            turn_applied = 0
+            for piece in piece_indices:
+                cleaned, applied, _skipped = apply_edits(pieces[piece], edit_lists[piece], entries)
+                cleaned_parts.append(cleaned)
+                turn_applied += len(applied)
+            cleaned = " ".join(cleaned_parts)
+            if cleaned.strip():
+                bodies[turns[0]] = cleaned
+                applied_count += turn_applied
+            continue
+        piece = piece_indices[0]
+        edits = [
+            edit for edit in edit_lists[piece]
+            if TURN_MARK not in (edit.get("find") or "") and TURN_MARK not in (edit.get("replace") or "")
+        ]
+        cleaned, applied, _skipped = apply_edits(pieces[piece], edits, entries)
+        split = cleaned.split(TURN_SEPARATOR)
+        if len(split) != len(turns):
+            print("   ⚠️ Transcript cleanup changed a turn boundary; keeping those turns raw")
+            continue
+        for index, text in zip(turns, split):
+            if text.strip():
+                bodies[index] = text
+        applied_count += len(applied)
+    if applied_count:
+        print(f"   ✨ Transcript cleanup applied {applied_count} edits")
+    return [(header, body) for (header, _old), body in zip(blocks, bodies)]
 
 
 def _clean_body(
@@ -332,19 +469,13 @@ def _clean_body(
     context: str,
     client: OpenAI,
     vocabulary: Optional[list[dict]] = None,
+    on_progress: Optional[ProgressCallback] = None,
 ) -> str:
     if not transcript.strip():
         return transcript
-    entries = vocabulary or []
-    vocabulary_text = format_for_cleanup(entries) if entries else "(none)"
-    meeting_context = (context or "")[:CONTEXT_CHARS]
+    entries, request = _requester(client, context, language, vocabulary)
     parts = windows(transcript)
-    workers = min(MAX_WINDOW_WORKERS, len(parts))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        edit_lists = list(executor.map(
-            lambda part: _edits_or_none(client, part, meeting_context, language, vocabulary_text),
-            parts,
-        ))
+    edit_lists = _run_requests(parts, request, on_progress)
     cleaned_parts = []
     applied_count = 0
     for part, edits in zip(parts, edit_lists):
