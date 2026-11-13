@@ -19,6 +19,8 @@ class UploadSessions:
         self.repo, self.storage, self.enabled = repository, storage, enabled
     def bootstrap_upload(self, user_id, request):
         user_id=str(UUID(user_id)); meeting_id=str(request.meeting_id)
+        if request.speaker_labels and (request.transcription_provider != 'xai' or len(request.files) != 1):
+            raise HTTPException(400, detail={'code': 'speaker_labels_require_one_xai_file'})
         # Verify meeting existence and ownership even for refresh, before signing.
         if not self.repo.owns_meeting(user_id,meeting_id): raise HTTPException(404,detail={'code':'meeting_not_found'})
         digest=hashlib.sha256(json.dumps(request.model_dump(mode='json'),sort_keys=True,separators=(',',':')).encode()).hexdigest()
@@ -26,7 +28,7 @@ class UploadSessions:
         if session is None:
             if not self.enabled(user_id): raise HTTPException(403,detail={'code':'background_upload_disabled'})
             sid=str(uuid4()); now=datetime.now(timezone.utc)
-            session=dict(id=sid,user_id=user_id,meeting_id=meeting_id,reserved_job_id=str(uuid4()),manifest_digest=digest,transcription_provider=request.transcription_provider,language=request.language,duration=request.duration,status='awaiting_upload',upload_deadline=(now+timedelta(hours=24)).isoformat())
+            session=dict(id=sid,user_id=user_id,meeting_id=meeting_id,reserved_job_id=str(uuid4()),manifest_digest=digest,transcription_provider=request.transcription_provider,language=request.language,duration=request.duration,speaker_labels=request.speaker_labels,status='awaiting_upload',upload_deadline=(now+timedelta(hours=24)).isoformat())
             files=[dict(session_id=sid,index=f.index,path=f'{user_id}/{meeting_id}/background/{sid}/{f.index}.{f.extension}',expected_bytes=f.expected_bytes,duration=f.duration,content_type=f.content_type,verified_at=None) for f in request.files]
             session=self.repo.create(session,files) # DB transaction handles racing callers.
         if session['manifest_digest'] != digest: raise HTTPException(409,detail={'code':'manifest_conflict'})
