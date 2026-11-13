@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from fastapi.testclient import TestClient
 import support
+import transcribe
 import main
 import jobs
 import supabase_client
@@ -165,6 +166,89 @@ class ReliabilityTests(unittest.TestCase):
             jobs.process_chunked_job({'id': 'new-job', 'meeting_id': 'meeting', 'total_chunks': 1, 'transcription_provider': 'xai'})
             self.assertEqual(create.call_count, 1)
             self.assertIsNone(chunk['transcript'])
+
+    def _chunk_job_patches(self, stack, chunks, audio=b'whole-recording'):
+        values = {
+            'get_job': {'status': 'processing'},
+            'reset_chunk_transcripts': None,
+            'get_audio_chunks': chunks,
+            'update_job_status': None,
+            'update_job_progress': None,
+            'update_chunk_transcript': None,
+            'update_chunks_processed': None,
+            'increment_retry_count': None,
+            'download_chunk_from_storage': audio,
+            'generate_summary': 'summary',
+            'generate_overview': 'overview',
+            'extract_actions': [],
+            'clean_transcript': 'cleaned transcript',
+            'update_job_with_results': None,
+        }
+        mocks = {}
+        for name, value in values.items():
+            mocks[name] = stack.enter_context(patch.object(jobs, name, return_value=value))
+        mocks['create_provider_transcription'] = stack.enter_context(
+            patch.object(jobs, 'create_provider_transcription', create=True, return_value='[0:00:00–0:00:01] Speaker 1\nCiao\n')
+        )
+        mocks['transcribe_audio'] = stack.enter_context(
+            patch.object(jobs, 'transcribe_audio', return_value={'transcript': 'plain chunk', 'duration': 1})
+        )
+        mocks['chunk_audio'] = stack.enter_context(patch.object(transcribe, 'chunk_audio', return_value=[b'a', b'b']))
+        return mocks
+
+    def test_speaker_job_diarizes_the_whole_chunk_once(self):
+        chunk = {'id': 'chunk', 'chunk_index': 0, 'file_path': 'user/meeting/0.m4a'}
+        audio = b'whole-recording-bytes'
+        with ExitStack() as stack:
+            mocks = self._chunk_job_patches(stack, [chunk], audio)
+            jobs.process_chunked_job({
+                'id': 'job', 'meeting_id': 'meeting', 'total_chunks': 1,
+                'transcription_provider': 'xai', 'speaker_labels': True,
+                'language': 'it', 'user_id': 'user', 'duration': 600,
+            })
+        create = mocks['create_provider_transcription']
+        self.assertEqual(create.call_count, 1)
+        self.assertEqual(create.call_args.kwargs['diarize'], True)
+        self.assertEqual(create.call_args.args[1].getvalue(), audio)
+        mocks['transcribe_audio'].assert_not_called()
+        mocks['chunk_audio'].assert_not_called()
+        self.assertIn(('job', 15, 'Transcribing'), [call.args for call in mocks['update_job_progress'].call_args_list])
+        self.assertEqual(
+            mocks['update_job_with_results'].call_args.kwargs['raw_transcript'],
+            '[0:00:00–0:00:01] Speaker 1\nCiao\n',
+        )
+        mocks['generate_summary'].assert_called_once_with('[0:00:00–0:00:01] Speaker 1\nCiao\n')
+
+    def test_speaker_labels_with_two_chunks_raises_before_any_provider_call(self):
+        chunks = [
+            {'id': 'a', 'chunk_index': 0, 'file_path': 'a.m4a'},
+            {'id': 'b', 'chunk_index': 1, 'file_path': 'b.m4a'},
+        ]
+        with ExitStack() as stack:
+            mocks = self._chunk_job_patches(stack, chunks)
+            with self.assertRaises(RuntimeError):
+                jobs.process_chunked_job({
+                    'id': 'job', 'meeting_id': 'meeting', 'total_chunks': 2,
+                    'transcription_provider': 'xai', 'speaker_labels': True,
+                })
+        mocks['create_provider_transcription'].assert_not_called()
+        mocks['transcribe_audio'].assert_not_called()
+        mocks['chunk_audio'].assert_not_called()
+        mocks['download_chunk_from_storage'].assert_not_called()
+
+    def test_speaker_labels_off_still_transcribes_each_chunk(self):
+        chunks = [
+            {'id': 'a', 'chunk_index': 0, 'file_path': 'a.m4a'},
+            {'id': 'b', 'chunk_index': 1, 'file_path': 'b.m4a'},
+        ]
+        with ExitStack() as stack:
+            mocks = self._chunk_job_patches(stack, chunks)
+            jobs.process_chunked_job({
+                'id': 'job', 'meeting_id': 'meeting', 'total_chunks': 2,
+                'transcription_provider': 'xai', 'speaker_labels': False, 'language': 'it',
+            })
+        self.assertEqual(mocks['transcribe_audio'].call_count, 2)
+        mocks['create_provider_transcription'].assert_not_called()
 
     def test_cleanup_failure_keeps_the_raw_transcript(self):
         with ExitStack() as stack:

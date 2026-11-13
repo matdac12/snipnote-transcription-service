@@ -22,11 +22,15 @@ from supabase_client import (
     update_chunks_processed,
     increment_retry_count
 )
-from transcribe import transcribe_audio
+from transcribe import client as transcription_client, transcribe_audio
 from ai_config import create_response
 from transcript_cleanup import clean_transcript
 from vocabulary import entries_for_user
-from transcription_provider import TranscriptionProviderError
+from transcription_provider import TranscriptionProviderError, create_provider_transcription
+
+
+class SpeakerTranscriptError(RuntimeError):
+    """A speaker job is not one xAI file. It must not be transcribed in pieces."""
 
 
 # Maximum retry attempts before permanent failure
@@ -472,6 +476,44 @@ def process_single_chunk(chunk: Dict[str, Any], total_chunks: int, language: str
         raise
 
 
+def transcribe_chunks_in_parallel(job_id, chunks, language, provider, job):
+    """Transcribe each stored chunk on its own. Speaker jobs never reach this."""
+    print(f"   🚀 Processing {len(chunks)} chunks in parallel (max {MAX_CHUNK_WORKERS} workers)...")
+    update_job_progress(job_id, 10, f"Transcribing {len(chunks)} chunks in parallel...")
+    chunk_results: Dict[int, str] = {}
+    completed_count = 0
+    chunk_errors = []
+    with ThreadPoolExecutor(max_workers=MAX_CHUNK_WORKERS) as executor:
+        future_to_chunk = {
+            executor.submit(process_single_chunk, chunk, len(chunks), language, provider, job_id, bool(job.get("retry_count")), job.get("user_id")): chunk
+            for chunk in chunks
+        }
+        for future in as_completed(future_to_chunk):
+            chunk = future_to_chunk[future]
+            try:
+                result = future.result()
+                ensure_job_active(job_id)
+                update_chunk_transcript(result["chunk_id"], result["transcript"])
+                chunk_results[result["chunk_index"]] = result["transcript"]
+                completed_count += 1
+                current_progress = 5 + int((completed_count / len(chunks)) * 65)
+                update_job_progress(job_id, current_progress, f"Transcribed {completed_count}/{len(chunks)} chunks...")
+                update_chunks_processed(job_id, completed_count)
+            except Exception as error:
+                print(f"   ❌ Chunk {chunk.get('chunk_index', '?')} failed: {error}")
+                chunk_errors.append(error)
+    if chunk_errors:
+        raise chunk_errors[0]
+    ensure_job_active(job_id)
+    transcripts = [chunk_results[i] for i in sorted(chunk_results.keys())]
+    print(f"   ✅ All {len(transcripts)} chunks transcribed in parallel")
+    print(f"   🔗 Merging {len(transcripts)} chunk transcripts...")
+    update_job_progress(job_id, 70, "Merging transcripts...")
+    full_transcript = "\n".join(transcripts)
+    print(f"   ✅ Merged transcript: {len(full_transcript)} chars")
+    return full_transcript
+
+
 def process_chunked_job(job: Dict[str, Any]):
     """
     Process a chunked transcription job
@@ -505,66 +547,18 @@ def process_chunked_job(job: Dict[str, Any]):
         if len(chunks) != total_chunks:
             print(f"   ⚠️ Expected {total_chunks} chunks, found {len(chunks)}")
 
-        # Step 3: Process chunks in PARALLEL (5-70% total progress)
-        # Using ThreadPoolExecutor for 5-10x speedup on chunked jobs
-        print(f"   🚀 Processing {len(chunks)} chunks in parallel (max {MAX_CHUNK_WORKERS} workers)...")
-        update_job_progress(job_id, 10, f"Transcribing {len(chunks)} chunks in parallel...")
-
-        # Track results by chunk_index to maintain order
-        chunk_results: Dict[int, str] = {}
-        completed_count = 0
-        chunk_errors = []
-
-        with ThreadPoolExecutor(max_workers=MAX_CHUNK_WORKERS) as executor:
-            # Submit all chunks for parallel processing
-            future_to_chunk = {
-                executor.submit(process_single_chunk, chunk, len(chunks), language, provider, job_id, bool(job.get("retry_count")), job.get("user_id")): chunk
-                for chunk in chunks
-            }
-
-            # Process completed chunks as they finish
-            for future in as_completed(future_to_chunk):
-                chunk = future_to_chunk[future]
-                try:
-                    result = future.result()
-                    chunk_id = result["chunk_id"]
-                    chunk_index = result["chunk_index"]
-                    transcript = result["transcript"]
-
-                    ensure_job_active(job_id)
-                    # Save transcript to database
-                    update_chunk_transcript(chunk_id, transcript)
-
-                    # Store result by index for ordered merging later
-                    chunk_results[chunk_index] = transcript
-
-                    # Update progress
-                    completed_count += 1
-                    current_progress = 5 + int((completed_count / len(chunks)) * 65)
-                    update_job_progress(
-                        job_id,
-                        current_progress,
-                        f"Transcribed {completed_count}/{len(chunks)} chunks..."
-                    )
-                    update_chunks_processed(job_id, completed_count)
-
-                except Exception as e:
-                    chunk_index = chunk.get("chunk_index", "?")
-                    print(f"   ❌ Chunk {chunk_index} failed: {e}")
-                    chunk_errors.append(e)
-
-        if chunk_errors:
-            raise chunk_errors[0]
-        ensure_job_active(job_id)
-        # Build ordered transcripts list from results
-        transcripts = [chunk_results[i] for i in sorted(chunk_results.keys())]
-        print(f"   ✅ All {len(transcripts)} chunks transcribed in parallel")
-
-        # Step 4: Merge transcripts (70%)
-        print(f"   🔗 Merging {len(transcripts)} chunk transcripts...")
-        update_job_progress(job_id, 70, "Merging transcripts...")
-        full_transcript = "\n".join(transcripts)
-        print(f"   ✅ Merged transcript: {len(full_transcript)} chars")
+        if job.get("speaker_labels"):
+            if provider != "xai" or len(chunks) != 1:
+                raise SpeakerTranscriptError("speaker_labels requires one xAI file")
+            update_job_progress(job_id, 15, "Transcribing")
+            audio = download_chunk_from_storage(chunks[0]["file_path"])
+            audio_file = io.BytesIO(audio)
+            audio_file.name = chunks[0]["file_path"].rsplit("/", 1)[-1] or "audio.m4a"
+            full_transcript = create_provider_transcription(
+                transcription_client, audio_file, language, provider, job.get("user_id"), diarize=True,
+            )
+        else:
+            full_transcript = transcribe_chunks_in_parallel(job_id, chunks, language, provider, job)
         require_speech(full_transcript)
 
         # Step 5: Generate AI content (70-90%)
@@ -608,6 +602,16 @@ def process_chunked_job(job: Dict[str, Any]):
         print(f"   - Summary: {len(summary)} chars")
         print(f"   - Actions: {len(actions)} items")
 
+    except SpeakerTranscriptError as error:
+        print(f"❌ Chunked job {job_id} refused: {error}")
+        try:
+            ensure_job_active(job_id)
+            update_job_status(job_id=job_id, status="failed", error=str(error))
+        except TranscriptionCancelled:
+            print(f"   ⏹️ Job {job_id} cancelled; not requeued")
+        except Exception as update_error:
+            print(f"   ⚠️  Failed to update job status: {update_error}")
+        raise
     except TranscriptionCancelled:
         print(f"   ⏹️ Job {job_id} cancelled; no retry or result will be saved")
         return
@@ -821,9 +825,12 @@ async def process_job_async(job: Dict[str, Any]):
     job_id = job["id"]
     print(f"\n🔄 [Job {job_id[:8]}] Starting...")
 
-    # Run the synchronous process_job in a thread pool to avoid blocking
+    # One bad job must not cancel the other jobs in this batch.
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, process_job, job)
+    try:
+        await loop.run_in_executor(None, process_job, job)
+    except Exception as error:
+        print(f"   ❌ [Job {job_id[:8]}] {error}")
 
 
 if __name__ == "__main__":
