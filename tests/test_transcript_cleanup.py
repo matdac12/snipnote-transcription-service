@@ -148,6 +148,34 @@ class RequestTests(unittest.TestCase):
         self.assertIn("Il sistema è un assistente AI", user)
         self.assertIn("attivi attivi", user)
 
+    def test_speaker_header_is_not_editable_and_filler_still_is(self):
+        text = "[0:00:00\u20130:00:04] Speaker 1\nCiao ehm Mattia.\n"
+        seen = []
+
+        def fake(_client, window, _context, _language, _vocabulary):
+            seen.append(window)
+            return [
+                _edit("Speaker 1", "", op="delete", kind="filler"),
+                _edit("Ciao ehm Mattia", "Ciao Mattia", kind="filler"),
+            ]
+
+        with patch.object(transcript_cleanup, "_request_edits", side_effect=fake):
+            cleaned = transcript_cleanup.clean_transcript(text, "it", "contesto", client=object())
+        self.assertEqual(seen, ["Ciao ehm Mattia."])
+        self.assertEqual(cleaned, "[0:00:00\u20130:00:04] Speaker 1\nCiao Mattia.\n")
+
+    def test_plain_transcript_still_uses_one_cleanup_window(self):
+        seen = []
+
+        def fake(_client, window, _context, _language, _vocabulary):
+            seen.append(window)
+            return []
+
+        with patch.object(transcript_cleanup, "_request_edits", side_effect=fake):
+            cleaned = transcript_cleanup.clean_transcript("prima seconda terza", "it", "", client=object())
+        self.assertEqual(seen, ["prima seconda terza"])
+        self.assertEqual(cleaned, "prima seconda terza")
+
     def test_a_failed_window_stays_raw(self):
         with patch.object(transcript_cleanup, "_request_edits", side_effect=RuntimeError("429")):
             cleaned = transcript_cleanup.clean_transcript("parte parte il disastro", "it", "", client=object())

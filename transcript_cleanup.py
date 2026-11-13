@@ -27,6 +27,7 @@ MISHEARD_NEW_WORD_LIMIT = 2
 _PROTECTED = {"senza", "non", "mai", "niente", "nessuno", "not", "never"}
 
 _WORD = re.compile(r"[^\W_]+", re.UNICODE)
+_SPEAKER_HEADER = re.compile(r"^\[\d+:\d{2}:\d{2}–\d+:\d{2}:\d{2}\] Speaker \d+$")
 
 SYSTEM = """You are a transcript cleanup editor for a meeting-transcription product. You receive a machine transcript of a real conversation and return surgical edits. The transcript is a record of what people said: your job is to remove machine and speech noise, NOT to improve the speakers' grammar, style, or word choice.
 
@@ -98,6 +99,38 @@ EDIT_FORMAT = {
         }}},
     },
 }
+
+
+def split_speaker_blocks(text: str) -> list[tuple[str | None, str]]:
+    """Separate speaker header lines from the words cleanup is allowed to edit."""
+    lines = text.splitlines()
+    if not lines or not _SPEAKER_HEADER.match(lines[0]):
+        return [(None, text)]
+    blocks: list[tuple[str | None, str]] = []
+    header: str | None = None
+    body: list[str] = []
+
+    def flush():
+        if header is not None:
+            blocks.append((header, "\n".join(body)))
+
+    for line in lines:
+        if _SPEAKER_HEADER.match(line):
+            flush()
+            header = line
+            body = []
+        elif line == "":
+            continue
+        else:
+            body.append(line)
+    flush()
+    return blocks
+
+
+def join_speaker_blocks(blocks: list[tuple[str | None, str]]) -> str:
+    if len(blocks) == 1 and blocks[0][0] is None:
+        return blocks[0][1]
+    return "\n\n".join(f"{header}\n{body}" for header, body in blocks) + "\n"
 
 
 def windows(text: str) -> list[str]:
@@ -281,6 +314,25 @@ def clean_transcript(
     vocabulary: Optional[list[dict]] = None,
 ) -> str:
     """Return the transcript with safe edits applied. Unusable output stays raw."""
+    if not transcript.strip():
+        return transcript
+    blocks = split_speaker_blocks(transcript)
+    if blocks[0][0] is None:
+        return _clean_body(transcript, language, context, client, vocabulary)
+    cleaned = [
+        (header, _clean_body(body, language, context, client, vocabulary) if body.strip() else body)
+        for header, body in blocks
+    ]
+    return join_speaker_blocks(cleaned)
+
+
+def _clean_body(
+    transcript: str,
+    language: Optional[str],
+    context: str,
+    client: OpenAI,
+    vocabulary: Optional[list[dict]] = None,
+) -> str:
     if not transcript.strip():
         return transcript
     entries = vocabulary or []
