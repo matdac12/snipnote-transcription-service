@@ -34,6 +34,8 @@ class UploadSessions:
         digest=manifest_digest(request)
         session=self.repo.find(user_id,meeting_id)
         if session is None:
+            if self.repo.job_exists(user_id, meeting_id):
+                raise HTTPException(409, detail={'code': 'existing_job_conflict'})
             if not self.enabled(user_id): raise HTTPException(403,detail={'code':'background_upload_disabled'})
             sid=str(uuid4()); now=datetime.now(timezone.utc)
             session=dict(id=sid,user_id=user_id,meeting_id=meeting_id,reserved_job_id=str(uuid4()),manifest_digest=digest,transcription_provider=request.transcription_provider,language=request.language,duration=request.duration,speaker_labels=request.speaker_labels,status='awaiting_upload',upload_deadline=(now+timedelta(hours=24)).isoformat())
@@ -51,13 +53,14 @@ class UploadSessions:
         job = self.repo.get_job(job_id)
         if not job or job['user_id'] != user_id or not self.repo.owns_meeting(user_id, job['meeting_id']):
             raise HTTPException(404, detail={'code': 'job_not_found'})
-        # Already waiting for the worker. A second tap must not reset its retry count.
-        if job['status'] == 'pending':
+        # A lost response must not strand a job the worker already accepted.
+        # Only a failed job is rewritten. Pending, processing, and completed stay as they are.
+        if job['status'] == 'failed':
+            self.repo.requeue_failed_job(job_id)
             return {'job_id': job_id, 'status': 'pending'}
-        if job['status'] != 'failed':
-            raise HTTPException(409, detail={'code': 'job_not_failed'})
-        self.repo.requeue_failed_job(job_id)
-        return {'job_id': job_id, 'status': 'pending'}
+        if job['status'] in ('pending', 'processing', 'completed'):
+            return {'job_id': job_id, 'status': job['status']}
+        raise HTTPException(409, detail={'code': 'job_not_failed'})
     def get_upload_session(self,user_id,session_id):
         session=self.repo.get(str(UUID(session_id)))
         if not session or session['user_id'] != user_id or not self.repo.owns_meeting(user_id,session['meeting_id']): raise HTTPException(404,detail={'code':'session_not_found'})
@@ -95,8 +98,17 @@ class SupabaseUploadRepository:
         data=self.client.table('background_upload_sessions').select('*').eq('id',sid).execute().data
         return data[0] if data else None
     def create(self,session,files):
-        self.client.rpc('register_background_upload',{'p_session':session,'p_files':files}).execute()
+        try:
+            self.client.rpc('register_background_upload',{'p_session':session,'p_files':files}).execute()
+        except HTTPException:
+            raise
+        except Exception as error:
+            if 'existing_job_conflict' in str(error):
+                raise HTTPException(409, detail={'code': 'existing_job_conflict'}) from None
+            raise
         return self.find(session['user_id'],session['meeting_id'])
+    def job_exists(self, user, meeting):
+        return bool(self.client.table('transcription_jobs').select('id').eq('user_id', user).eq('meeting_id', meeting).limit(1).execute().data)
     def list_files(self,sid):
         return self.client.table('background_upload_files').select('*').eq('session_id',sid).order('index').execute().data
     def mark_verified(self,sid,index):

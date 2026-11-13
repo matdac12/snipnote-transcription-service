@@ -35,6 +35,8 @@ class Repository:
         return self.sessions[sid]
     def get_job(self, job_id):
         return getattr(self, 'jobs', {}).get(job_id)
+    def job_exists(self, user, meeting):
+        return any(job['user_id'] == user and job['meeting_id'] == meeting for job in getattr(self, 'jobs', {}).values())
     def requeue_failed_job(self, job_id):
         job = self.jobs[job_id]
         job.update(status='pending', retry_count=0, error_message=None)
@@ -110,10 +112,9 @@ class UploadSessionTests(unittest.TestCase):
         self.assertEqual(self.repo.jobs[failed]['status'], 'pending')
         self.assertEqual(self.repo.jobs[failed]['retry_count'], 0)
         self.assertIsNone(self.repo.jobs[failed]['error_message'])
-        with self.assertRaises(HTTPException) as busy:
-            self.service.retry_failed_upload(OWNER, live)
-        self.assertEqual(busy.exception.status_code, 409)
+        self.assertEqual(self.service.retry_failed_upload(OWNER, live)['status'], 'processing')
         self.assertEqual(self.repo.jobs[live]['status'], 'processing')
+        self.assertEqual(self.repo.jobs[live]['retry_count'], 0)
         with self.assertRaises(HTTPException) as missing:
             self.service.retry_failed_upload(str(uuid4()), failed)
         self.assertEqual(missing.exception.status_code, 404)
@@ -122,6 +123,14 @@ class UploadSessionTests(unittest.TestCase):
         self.assertEqual(self.service.retry_failed_upload(OWNER, pending)['status'], 'pending')
         self.assertEqual(self.repo.jobs[pending]['retry_count'], 2)
         self.assertEqual(self.repo.jobs[pending]['error_message'], 'keep')
+
+    def test_new_session_rejects_a_meeting_that_already_has_a_job(self):
+        self.repo.jobs = {str(uuid4()): dict(user_id=OWNER, meeting_id=MEETING, status='failed')}
+        with self.assertRaises(HTTPException) as error:
+            self.bootstrap()
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertEqual(error.exception.detail['code'], 'existing_job_conflict')
+        self.assertFalse(self.repo.sessions)
 
     def test_pre_update_session_refreshes_and_still_rejects_a_real_change(self):
         payload = self.request.model_dump(mode='json')

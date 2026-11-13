@@ -72,6 +72,19 @@ def prove_speaker_rules(c):
     if stored!=(True,True,1) or chunk!=(524288000,1):
         raise SystemExit(f'Speaker promotion mismatch: job={stored} chunk={chunk}')
     print('500 MB xAI speaker session registered and promoted with speaker_labels and total_chunks 1')
+    legacy_meeting, sid2, job2 = str(uuid4()), str(uuid4()), str(uuid4())
+    c.execute("insert into meetings(id,user_id,name) values (%s,%s,'legacy')", (legacy_meeting, user))
+    c.execute("insert into transcription_jobs(id,user_id,meeting_id,status) values (%s,%s,%s,'failed')", (job2, user, legacy_meeting))
+    c.execute('set role service_role')
+    try:
+        c.execute('select register_background_upload(%s,%s)', (Jsonb(session('xai', True, legacy_meeting, sid2, str(uuid4()), 600)), Jsonb(one(legacy_meeting, sid2, 50, 600))))
+    except psycopg.errors.RaiseException as error:
+        c.execute('reset role')
+        if 'existing_job_conflict' not in str(error) or c.execute('select count(*) from background_upload_sessions where id=%s', (sid2,)).fetchone()[0]:
+            raise SystemExit('existing job stored a second session') from error
+        print('Rejected: second session after a job exists')
+    else:
+        raise SystemExit('second session after a job exists was accepted')
     for label,provider,speaker,files in [
         ('openai 16 MB', 'openai', False, None),
         ('two-file speaker', 'xai', True, 'two'),
